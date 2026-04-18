@@ -123,15 +123,16 @@ public class Layouts.ItemSidebarView : Adw.Bin {
         content_textview.remove_css_class ("view");
         content_textview.add_css_class ("card");
 
-#if WITH_LIBSPELLING
+/* libspelling + enchant on Windows can hit g_signal_connect_object(NULL) during adapter setup; skip on IS_WINDOWS. */
+#if WITH_LIBSPELLING && !IS_WINDOWS
         var source_buffer = new GtkSource.Buffer (null);
         content_textview.buffer = source_buffer;
-        
+
         var adapter = new Spelling.TextBufferAdapter (source_buffer, Spelling.Checker.get_default ());
         content_textview.extra_menu = adapter.get_menu_model ();
         content_textview.insert_action_group ("spelling", adapter);
         adapter.enabled = Services.Settings.get_default ().settings.get_boolean ("spell-checking-enabled");
-        
+
         Services.Settings.get_default ().settings.changed["spell-checking-enabled"].connect (() => {
             adapter.enabled = Services.Settings.get_default ().settings.get_boolean ("spell-checking-enabled");
         });

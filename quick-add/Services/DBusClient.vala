@@ -28,9 +28,12 @@ public interface DBusClientInterface : Object {
 public class DBusClient : Object {
     public DBusClientInterface ? interface = null;
 
-    private static GLib.Once<DBusClient> instance;
+    private static DBusClient? _instance = null;
     public static unowned DBusClient get_default () {
-        return instance.once (() => { return new DBusClient (); });
+        if (_instance == null) {
+            _instance = new DBusClient ();
+        }
+        return _instance;
     }
 
     construct {

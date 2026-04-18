@@ -24,10 +24,13 @@ public class Services.DBusServer : Object {
     private const string DBUS_NAME = "io.github.alainm23.planify";
     private const string DBUS_PATH = "/io/github/alainm23/planify";
 
-    private static GLib.Once<DBusServer> instance;
+    private static DBusServer? _instance = null;
 
     public static unowned DBusServer get_default () {
-        return instance.once (() => { return new DBusServer (); });
+        if (_instance == null) {
+            _instance = new DBusServer ();
+        }
+        return _instance;
     }
 
     public signal void item_added (string id);

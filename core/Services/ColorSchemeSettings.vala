@@ -44,37 +44,68 @@ namespace ColorSchemeSettings {
             }
             private set {
                 _prefers_color_scheme = value;
+                notify_property ("prefers-color-scheme");
             }
         }
 
-        private static GLib.Once<ColorSchemeSettings.Settings> instance;
+        private static ColorSchemeSettings.Settings? _instance = null;
         public static unowned ColorSchemeSettings.Settings get_default () {
-            return instance.once (() => {
-                return new ColorSchemeSettings.Settings ();
-            });
+            if (_instance == null) {
+                _instance = new ColorSchemeSettings.Settings ();
+            }
+            return _instance;
         }
 
         private Portal.Settings? portal = null;
 
         private Settings () {}
 
+        [CCode (cname = "macos_is_dark_mode")]
+        private extern static int macos_is_dark_mode ();
+
         private void setup_prefers_color_scheme () {
-            try {
-                portal = Portal.Settings.get ();
+            // macOS native code paths via CoreFoundation integration
+            if (GLib.FileUtils.test ("/usr/bin/defaults", GLib.FileTest.EXISTS)) {
+                // Instantly query the native macOS CoreFoundation state
+                var is_dark = macos_is_dark_mode () == 1;
+                prefers_color_scheme = is_dark ? ColorScheme.DARK : ColorScheme.LIGHT;
 
-                prefers_color_scheme = (ColorScheme) portal.read (
-                    "org.freedesktop.appearance",
-                    "color-scheme"
-                ).get_variant ().get_uint32 ();
-
-                portal.setting_changed.connect ((scheme, key, value) => {
-                    if (scheme == "org.freedesktop.appearance" && key == "color-scheme") {
-                        prefers_color_scheme = (ColorScheme) value.get_uint32 ();
+                // Safely poll the CoreFoundation memory state dynamically with zero latency
+                GLib.Timeout.add_seconds (2, () => {
+                    var current_dark = macos_is_dark_mode () == 1;
+                    var new_scheme = current_dark ? ColorScheme.DARK : ColorScheme.LIGHT;
+                    if (new_scheme != prefers_color_scheme) {
+                        prefers_color_scheme = new_scheme;
                     }
+                    return GLib.Source.CONTINUE; // Continue polling cleanly
                 });
                 return;
+            }
+
+            // Try freedesktop portal (Linux)
+            try {
+                portal = Portal.Settings.get ();
+                if (portal != null) {
+                    var result = portal.read (
+                        "org.freedesktop.appearance",
+                        "color-scheme"
+                    );
+                    if (result != null) {
+                        var variant = result.get_variant ();
+                        if (variant != null) {
+                            prefers_color_scheme = (ColorScheme) variant.get_uint32 ();
+
+                            portal.setting_changed.connect ((scheme, key, value) => {
+                                if (scheme == "org.freedesktop.appearance" && key == "color-scheme") {
+                                    prefers_color_scheme = (ColorScheme) value.get_uint32 ();
+                                }
+                            });
+                            return;
+                        }
+                    }
+                }
             } catch (Error e) {
-                debug ("cannot use the portal, using the AccountsService: %s", e.message);
+                debug ("Portal not available: %s", e.message);
             }
 
             prefers_color_scheme = ColorScheme.NO_PREFERENCE;

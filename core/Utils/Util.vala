@@ -288,6 +288,10 @@ public class Util : GLib.Object {
         string card_bg_color = "";
 
         if (dark_mode) {
+            if (appearance_mode != Appearance.DARK && appearance_mode != Appearance.DARK_BLUE) {
+                appearance_mode = Appearance.DARK; // default dark theme if user came from LIGHT mode
+            }
+
             if (appearance_mode == Appearance.DARK) {
                 window_bg_color = "#181818";
                 popover_bg_color = "#202020";
@@ -765,7 +769,8 @@ We hope you’ll enjoy using Planify!""");
         GLib.MatchInfo match;
 
         try {
-            regex = new GLib.Regex ("%s:(.*)".printf (key));
+            // Support both Key:Value and Key;PARAM=Value:Value formats
+            regex = new GLib.Regex ("%s(?:;.*)?:(.*)".printf (key));
         } catch (GLib.RegexError e) {
             critical (e.message);
         }
@@ -774,11 +779,11 @@ We hope you’ll enjoy using Planify!""");
             return "";
         }
 
-        if (!regex.match (data.strip (), 0, out match)) {
+        if (!regex.match (data, 0, out match)) {
             return "";
         }
 
-        return match.fetch_all ()[1];
+        return match.fetch (1).strip ();
     }
 
     public static bool find_boolean_value (string key, string data) {
@@ -786,7 +791,7 @@ We hope you’ll enjoy using Planify!""");
         GLib.MatchInfo match;
 
         try {
-            regex = new GLib.Regex ("%s:(.*)".printf (key));
+            regex = new GLib.Regex ("%s(?:;.*)?:(.*)".printf (key));
         } catch (GLib.RegexError e) {
             critical (e.message);
         }
@@ -799,7 +804,7 @@ We hope you’ll enjoy using Planify!""");
             return false;
         }
 
-        return bool.parse (match.fetch_all () [1]);
+        return bool.parse (match.fetch (1).strip ());
     }
 
     public static string generate_extra_data (string ical_url, string etag, string data) {
@@ -821,6 +826,59 @@ We hope you’ll enjoy using Planify!""");
         Json.Node root = builder.get_root ();
         generator.set_root (root);
         return generator.to_data (null);
+    }
+
+    public static string get_etag_from_extra_data (string extra_data) {
+        if (extra_data == null || extra_data == "") {
+            return "";
+        }
+
+        try {
+            var parser = new Json.Parser ();
+            parser.load_from_data (extra_data, -1);
+            var obj = parser.get_root ().get_object ();
+            if (obj.has_member ("etag")) {
+                string? etag = obj.get_string_member ("etag");
+                return etag != null ? etag : "";
+            }
+        } catch (Error e) {
+            debug ("get_etag_from_extra_data: %s", e.message);
+        }
+
+        return "";
+    }
+
+    public static string get_ical_url_from_extra_data (string extra_data) {
+        if (extra_data == null || extra_data == "") {
+            return "";
+        }
+
+        try {
+            var parser = new Json.Parser ();
+            parser.load_from_data (extra_data, -1);
+            var obj = parser.get_root ().get_object ();
+            if (obj.has_member ("ical_url")) {
+                string? u = obj.get_string_member ("ical_url");
+                return u != null ? u : "";
+            }
+        } catch (Error e) {
+            debug ("get_ical_url_from_extra_data: %s", e.message);
+        }
+
+        return "";
+    }
+
+    public static string normalize_caldav_calendar_url (string url) {
+        if (url == null || url == "") {
+            return "";
+        }
+
+        string s = url.strip ();
+        while (s.has_suffix ("/") && s.length > 1) {
+            s = s.substring (0, s.length - 1);
+        }
+
+        return s;
     }
 
     public async void move_backend_type_item (Objects.Item item, Objects.Project target_project, string parent_id = "", bool notify = true) {

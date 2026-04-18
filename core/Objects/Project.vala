@@ -90,7 +90,11 @@ public class Objects.Project : Objects.BaseObject {
 
     public SourceType source_type {
         get {
-            return source.source_type;
+            Objects.Source? s = source;
+            if (s == null) {
+                return SourceType.NONE;
+            }
+            return s.source_type;
         }
     }
 
@@ -139,6 +143,12 @@ public class Objects.Project : Objects.BaseObject {
     public bool is_inbox_project {
         get {
             return id == Services.Settings.get_default ().settings.get_string ("local-inbox-project-id");
+        }
+    }
+
+    public bool can_have_sections {
+        get {
+            return source_type == SourceType.LOCAL || source_type == SourceType.TODOIST || source_type == SourceType.CALDAV;
         }
     }
 
@@ -317,9 +327,37 @@ public class Objects.Project : Objects.BaseObject {
         }
         if (propstat.get_first_prop_with_tagname ("calendar-color") != null) {
             color = propstat.get_first_prop_with_tagname ("calendar-color").text_content;
+        } else if (propstat.get_first_prop_with_tagname ("apple-calendar-color") != null) {
+            color = propstat.get_first_prop_with_tagname ("apple-calendar-color").text_content;
+        } else if (propstat.get_first_prop_with_tagname ("oc:calendar-color") != null) {
+            color = propstat.get_first_prop_with_tagname ("oc:calendar-color").text_content;
         }
+
+        if (propstat.get_first_prop_with_tagname ("X-PLANIFY-EMOJI") != null) {
+            emoji = propstat.get_first_prop_with_tagname ("X-PLANIFY-EMOJI").text_content;
+        } else if (propstat.get_first_prop_with_tagname ("calendar-icon") != null) {
+            emoji = propstat.get_first_prop_with_tagname ("calendar-icon").text_content;
+        } else if (propstat.get_first_prop_with_tagname ("apple-calendar-icon") != null) {
+            emoji = propstat.get_first_prop_with_tagname ("apple-calendar-icon").text_content;
+        } else if (propstat.get_first_prop_with_tagname ("calendar-emoji") != null) {
+            emoji = propstat.get_first_prop_with_tagname ("calendar-emoji").text_content;
+        }
+
+        if (propstat.get_first_prop_with_tagname ("X-PLANIFY-ICON-STYLE") != null) {
+            var style_str = propstat.get_first_prop_with_tagname ("X-PLANIFY-ICON-STYLE").text_content;
+            icon_style = ProjectIconStyle.parse (style_str);
+        }
+
+        if (propstat.get_first_prop_with_tagname ("X-PLANIFY-DESCRIPTION") != null) {
+            var d = propstat.get_first_prop_with_tagname ("X-PLANIFY-DESCRIPTION").text_content;
+            description = d != null ? d : "";
+        }
+
         if (update_sync_token) {
-            sync_id = propstat.get_first_prop_with_tagname ("sync-token").text_content;
+            var st = propstat.get_first_prop_with_tagname ("sync-token");
+            if (st != null && st.text_content != null) {
+                sync_id = st.text_content;
+            }
         }
     }
 
@@ -432,9 +470,10 @@ public class Objects.Project : Objects.BaseObject {
         update_timeout_id = Timeout.add (timeout, () => {
             update_timeout_id = 0;
 
-            if (backend_type == SourceType.LOCAL) {
-                Services.Store.instance ().update_project (this);
-            } else if (backend_type == SourceType.TODOIST) {
+            // Optimistic local update
+            Services.Store.instance ().update_project (this);
+
+            if (backend_type == SourceType.TODOIST) {
                 if (show_loading) {
                     loading = true;
                 }
@@ -493,7 +532,20 @@ public class Objects.Project : Objects.BaseObject {
     public Objects.Section add_section_if_not_exists (Objects.Section new_section) {
         Objects.Section ? return_value = null;
         lock (_sections) {
+            // First check by ID (fast path for known sections)
             return_value = get_section (new_section.id);
+
+            // Also check by name within this project to prevent duplicates
+            // during CalDAV sync (parsed sections get new random IDs each time)
+            if (return_value == null) {
+                foreach (var section in sections) {
+                    if (section.name == new_section.name) {
+                        return_value = section;
+                        break;
+                    }
+                }
+            }
+
             if (return_value == null) {
                 new_section.set_project (this);
                 new_section.section_order = new_section.project.sections.size;

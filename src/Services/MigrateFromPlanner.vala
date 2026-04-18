@@ -20,12 +20,13 @@
  */
 
 public class Services.MigrateFromPlanner : GLib.Object {
-    static GLib.Once<MigrateFromPlanner> _instance;
+    private static MigrateFromPlanner? _instance = null;
 
     public static unowned MigrateFromPlanner get_default () {
-        return _instance.once (() => {
-            return new MigrateFromPlanner ();
-        });
+        if (_instance == null) {
+            _instance = new MigrateFromPlanner ();
+        }
+        return _instance;
     }
 
     public bool migrate_from_file (GLib.File file) {

@@ -102,12 +102,12 @@ public class Widgets.MarkdownEditor : Adw.Bin {
         create_format_popover ();
         update_mode ();
 
-#if WITH_LIBSPELLING
+#if WITH_LIBSPELLING && !IS_WINDOWS
         var adapter = new Spelling.TextBufferAdapter (buffer, Spelling.Checker.get_default ());
         text_view.extra_menu = adapter.get_menu_model ();
         text_view.insert_action_group ("spelling", adapter);
         adapter.enabled = Services.Settings.get_default ().settings.get_boolean ("spell-checking-enabled");
-        
+
         Services.Settings.get_default ().settings.changed["spell-checking-enabled"].connect (() => {
             adapter.enabled = Services.Settings.get_default ().settings.get_boolean ("spell-checking-enabled");
         });

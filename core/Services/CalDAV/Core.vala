@@ -70,13 +70,22 @@ public class Services.CalDAV.Core : GLib.Object {
 
 
     private string make_absolute_url (string base_url, string href) {
-        string abs_url = null;
-        try {
-            abs_url = GLib.Uri.resolve_relative (base_url, href, GLib.UriFlags.NONE).to_string ();
-        } catch (Error e) {
-            critical ("Failed to resolve relative url: %s", e.message);
+        if (href.strip () == "") {
+            warning ("make_absolute_url: empty href (base=%s)", base_url);
+            return null;
         }
-        return abs_url;
+
+        string h = href.strip ();
+        if (h.has_prefix ("http://") || h.has_prefix ("https://")) {
+            return h;
+        }
+
+        try {
+            return GLib.Uri.resolve_relative (base_url, h, GLib.UriFlags.NONE).to_string ();
+        } catch (Error e) {
+            warning ("Failed to resolve relative url (base=%s href=%s): %s", base_url, h, e.message);
+            return null;
+        }
     }
 
     public async string resolve_well_known_caldav (Soup.Session session, string base_url, bool ignore_ssl = false) throws GLib.Error {
@@ -267,10 +276,20 @@ public class Services.CalDAV.Core : GLib.Object {
 
         try {
             var cancellable = new GLib.Cancellable ();
+            var sync_token_at_sync_start = new Gee.HashMap<string, string> ();
+            foreach (Objects.Project p in Services.Store.instance ().get_projects_by_source (source.id)) {
+                sync_token_at_sync_start[p.id] = p.sync_id;
+            }
+
             yield caldav_client.sync (source, cancellable);
 
             foreach (Objects.Project project in Services.Store.instance ().get_projects_by_source (source.id)) {
-                yield caldav_client.sync_tasklist (project, cancellable);
+                try {
+                    string tok_before = sync_token_at_sync_start.has_key (project.id) ? sync_token_at_sync_start[project.id] : "";
+                    yield caldav_client.sync_tasklist (project, cancellable, tok_before);
+                } catch (Error e) {
+                    warning ("CalDAV: sync_tasklist failed for project \"%s\" (%s): %s", project.name, project.id, e.message);
+                }
             }
 
             source.sync_finished ();

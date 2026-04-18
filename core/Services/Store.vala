@@ -20,11 +20,12 @@
  */
 
 public class Services.Store : GLib.Object {
-    static GLib.Once<Services.Store> _instance;
+    private static Services.Store? _instance = null;
     public static unowned Services.Store instance () {
-        return _instance.once (() => {
-            return new Services.Store ();
-        });
+        if (_instance == null) {
+            _instance = new Services.Store ();
+        }
+        return _instance;
     }
 
     public signal void source_added (Objects.Source source);
@@ -444,9 +445,10 @@ public class Services.Store : GLib.Object {
 
     public Objects.Project get_project_via_url (string calendar_url) {
         Objects.Project ? return_value = null;
+        string key = Util.normalize_caldav_calendar_url (calendar_url);
         lock (_projects) {
             foreach (var project in projects) {
-                if (project.calendar_url == calendar_url) {
+                if (Util.normalize_caldav_calendar_url (project.calendar_url) == key) {
                     return_value = project;
                     break;
                 }
@@ -581,6 +583,20 @@ public class Services.Store : GLib.Object {
         return return_value;
     }
 
+    public Objects.Section? get_section_by_name (string project_id, string name) {
+        Objects.Section? return_value = null;
+        lock (_sections) {
+            foreach (var section in sections) {
+                if (section.project_id == project_id && section.name == name) {
+                    return_value = section;
+                    break;
+                }
+            }
+        }
+
+        return return_value;
+    }
+
     public Gee.ArrayList<Objects.Section> get_sections_archived_by_project (Objects.Project project) {
         Gee.ArrayList<Objects.Section> return_value = new Gee.ArrayList<Objects.Section> ();
         lock (_sections) {
@@ -641,6 +657,33 @@ public class Services.Store : GLib.Object {
     public bool insert_items_transaction (Gee.ArrayList<Objects.Item> items, bool insert = true) {
         if (Services.Database.get_default ().insert_items_transaction (items)) {
             foreach (var item in items) {
+                Objects.Item? existing = get_item (item.id);
+                if (existing != null) {
+                    // #region agent log
+                    int64 ts = GLib.get_real_time () / 1000;
+                    string eid = item.id.replace ("\\", "\\\\").replace ("\"", "\\\"");
+                    Constants.agent_debug_log_append_line (
+                        "{\"sessionId\":\"020cd6\",\"runId\":\"post-fix\",\"hypothesisId\":\"H7\"," +
+                        "\"location\":\"Store.insert_items_transaction\"," +
+                        "\"message\":\"Merge batched item into existing (avoid duplicate in-memory row)\"," +
+                        "\"data\":{\"itemId\":\"" + eid + "\"},\"timestamp\":" + ts.to_string () + "}\n"
+                    );
+                    // #endregion
+                    string old_project_id = existing.project_id;
+                    string old_parent_id = existing.parent_id;
+                    bool old_checked = existing.checked;
+                    existing.update_from_vtodo (item.calendar_data, item.ical_url, null);
+                    existing.project_id = item.project_id;
+                    update_item (existing);
+                    if (old_project_id != existing.project_id || old_parent_id != existing.parent_id) {
+                        Services.EventBus.get_default ().item_moved (existing, old_project_id, "", old_parent_id);
+                    }
+                    if (old_checked != existing.checked) {
+                        complete_item (existing, old_checked);
+                    }
+                    continue;
+                }
+
                 insert_item (item, insert, false);
 
                 #if WITH_EVOLUTION
@@ -853,6 +896,11 @@ public class Services.Store : GLib.Object {
         lock (_items) {
             foreach (var item in items) {
                 if (item.id == id) {
+                    return_value = item;
+                    break;
+                }
+                if (item.source != null && item.source.source_type == SourceType.CALDAV &&
+                    id.down () == item.id.down ()) {
                     return_value = item;
                     break;
                 }
@@ -1477,5 +1525,60 @@ public class Services.Store : GLib.Object {
 
     public void clear_project_cache (string project_id) {
         _items_by_project_cache.unset (project_id);
+    }
+
+    /**
+     * @param preferred_id Optional CalDAV VTODO UID to use as local section id (RFC 5545 UID) for stable cross-device mapping.
+     */
+    public Objects.Section? get_or_create_section_by_name (string project_id, string name, string? color = null, string? preferred_id = null) {
+        var normalized_name = name.strip ();
+        if (normalized_name == "") {
+            warning ("Store.get_or_create_section_by_name: empty section name");
+            return null;
+        }
+
+        lock (_sections) {
+            foreach (var section in sections) {
+                if (section.project_id == project_id && section.name.down ().strip () == normalized_name.down ().strip ()) {
+                    return section;
+                }
+            }
+
+            var new_section = new Objects.Section ();
+            if (preferred_id != null && preferred_id.strip () != "" && get_section (preferred_id) == null) {
+                new_section.id = preferred_id.strip ();
+            } else {
+                new_section.id = Util.get_default ().generate_id (new_section);
+            }
+            new_section.name = normalized_name;
+            new_section.project_id = project_id;
+            if (color != null && color != "") {
+                new_section.color = color;
+            } else {
+                new_section.color = Util.get_default ().get_random_color ();
+            }
+
+            if (Services.Database.get_default ().insert_section (new_section)) {
+                sections.add (new_section);
+
+                Objects.Project ? proj = get_project (project_id);
+                if (proj != null) {
+                    proj.add_section (new_section);
+                    proj.section_added (new_section);
+                } else {
+                    warning ("Store.get_or_create_section_by_name: project not found for project_id=%s", project_id);
+                }
+
+                return new_section;
+            } else {
+                foreach (var section in sections) {
+                    if (section.project_id == project_id && section.name.down ().strip () == normalized_name.down ().strip ()) {
+                        return section;
+                    }
+                }
+                warning ("Store.get_or_create_section_by_name: failed to create section '%s'", normalized_name);
+                return null;
+            }
+        }
     }
 }

@@ -57,6 +57,7 @@ public class Objects.Item : Objects.BaseObject {
     public string extra_data { get; set; default = ""; }
     public ItemType item_type { get; set; default = ItemType.TASK; }
     public string responsible_uid { get; set; default = ""; }
+    public bool needs_push { get; set; default = false; }
 
 
     public Objects.DueDate due { get; set; default = new Objects.DueDate (); }
@@ -465,24 +466,43 @@ public class Objects.Item : Objects.BaseObject {
         }
     }
 
-    public Item.from_vtodo (string data, string _ical_url, string _project_id) {
-        project_id = _project_id;
-        patch_from_vtodo (data, _ical_url);
+    public Item.from_vtodo (string data, string _ical_url, Objects.Project _project, string? remote_etag = null) {
+        set_project (_project);
+        patch_from_vtodo (data, _ical_url, false, remote_etag);
     }
 
-    public void update_from_vtodo (string data, string _ical_url) {
-        patch_from_vtodo (data, _ical_url, true);
+    public void update_from_vtodo (string data, string _ical_url, string? remote_etag = null) {
+        patch_from_vtodo (data, _ical_url, true, remote_etag);
     }
 
-    public void patch_from_vtodo (string data, string _ical_url, bool is_update = false) {
+    public void patch_from_vtodo (string data, string _ical_url, bool is_update = false, string? remote_etag = null) {
         ICal.Component ical = ICal.Parser.parse_string (data);
         ICal.Component ? ical_vtodo = ical.get_first_component (ICal.ComponentKind.VTODO_COMPONENT);
+        if (ical_vtodo == null) {
+            warning ("patch_from_vtodo: missing VTODO");
+            return;
+        }
 
-        id = ical.get_uid ();
-        content = ical.get_summary ();
+        id = ical_vtodo.get_uid ();
+        content = ical_vtodo.get_summary ();
+        if (content == null || content == "") {
+            content = _("Untitled Task");
+        }
 
-        if (ical.get_description () != null) {
-            description = ical.get_description ();
+        string? desc_vtodo = ical_vtodo.get_description ();
+        if (desc_vtodo != null && desc_vtodo != "") {
+            description = desc_vtodo;
+        } else if (is_update) {
+            if (desc_vtodo != null) {
+                description = "";
+            }
+        } else {
+            if (desc_vtodo == null) {
+                string? dcal = ical.get_description ();
+                description = dcal ?? "";
+            } else {
+                description = "";
+            }
         }
 
         ICal.Property ? priority_property = ical_vtodo.get_first_property (ICal.PropertyKind.PRIORITY_PROPERTY);
@@ -501,8 +521,10 @@ public class Objects.Item : Objects.BaseObject {
             }
         }
 
-        if (!ical.get_due ().is_null_time ()) {
-            due.date = Utils.Datetime.ical_to_date_time_local (ical.get_due ()).to_string ();
+        if (!ical_vtodo.get_due ().is_null_time ()) {
+            due.date = Utils.Datetime.ical_to_date_time_local (ical_vtodo.get_due ()).to_string ();
+        } else if (is_update) {
+            due.reset ();
         }
 
         ICal.Property ? rrule_property = ical_vtodo.get_first_property (ICal.PropertyKind.RRULE_PROPERTY);
@@ -521,7 +543,7 @@ public class Objects.Item : Objects.BaseObject {
             parent_id = "";
         }
 
-        if (ical.get_status () == ICal.PropertyStatus.COMPLETED) {
+        if (ical_vtodo.get_status () == ICal.PropertyStatus.COMPLETED) {
             checked = true;
             ICal.Property ? completed_property = ical_vtodo.get_first_property (ICal.PropertyKind.COMPLETED_PROPERTY);
             if (completed_property != null) {
@@ -536,12 +558,56 @@ public class Objects.Item : Objects.BaseObject {
             completed_at = "";
         }
 
-        ICal.Property ? sort_order_property = ical_vtodo.get_first_property (ICal.PropertyKind.from_string ("X-APPLE-SORT-ORDER"));
-        if (sort_order_property != null) {
-            var sort_order_str = sort_order_property.get_value_as_string ();
-            if (sort_order_str != null) {
-                child_order = int.parse (sort_order_str);
+        string? x_sort_order = null;
+        string? x_pinned = null;
+        string? x_section_name = null;
+        string? x_section_color = null;
+        string? x_section_id = null;
+        string? x_planify_type = null;
+        string? x_item_type = null;
+        string? x_deadline = null;
+        var planify_attach_payloads = new Gee.ArrayList<string> ();
+
+        ICal.Property ? xprop = ical_vtodo.get_first_property (ICal.PropertyKind.X_PROPERTY);
+        while (xprop != null) {
+            string? xname = xprop.get_x_name ();
+            string? xval = xprop.get_value_as_string ();
+            if (xname != null && xval != null) {
+                switch (xname) {
+                    case "X-APPLE-SORT-ORDER":
+                        x_sort_order = xval;
+                        break;
+                    case "X-PINNED":
+                        x_pinned = xval;
+                        break;
+                    case "X-PLANIFY-SECTION-NAME":
+                        x_section_name = xval;
+                        break;
+                    case "X-PLANIFY-SECTION-COLOR":
+                        x_section_color = xval;
+                        break;
+                    case "X-PLANIFY-SECTION-ID":
+                        x_section_id = xval;
+                        break;
+                    case "X-PLANIFY-TYPE":
+                        x_planify_type = xval;
+                        break;
+                    case "X-PLANIFY-ITEM-TYPE":
+                        x_item_type = xval;
+                        break;
+                    case "X-PLANIFY-DEADLINE":
+                        x_deadline = xval;
+                        break;
+                    case "X-PLANIFY-ATTACH":
+                        planify_attach_payloads.add (xval);
+                        break;
+                }
             }
+            xprop = ical_vtodo.get_next_property (ICal.PropertyKind.X_PROPERTY);
+        }
+
+        if (x_sort_order != null && x_sort_order != "") {
+            child_order = int.parse (x_sort_order);
         } else {
             // Items without an X-APPLE-SORT-ORDER must use the time in seconds
             // since 2001-01-01-00:00:00 (978307200L) as their sort order
@@ -554,28 +620,184 @@ public class Objects.Item : Objects.BaseObject {
             }
         }
 
-        ICal.Property ? pinned_property = ical_vtodo.get_first_property (ICal.PropertyKind.from_string ("X-PINNED"));
-        if (pinned_property != null) {
-            var pinned_str = pinned_property.get_value_as_string ();
-            if (pinned_str != null) {
-                pinned = bool.parse (pinned_str);
-            }
+        if (x_pinned != null && x_pinned != "") {
+            pinned = bool.parse (x_pinned);
         } else {
             pinned = false;
         }
 
-        extra_data = Util.generate_extra_data (_ical_url, "", ical.as_ical_string ());
-
-        #if WITH_EVOLUTION
-        ECal.Component ecal = new ECal.Component.from_icalcomponent (ical_vtodo);
-
-        if (is_update) {
-            check_labels (get_labels_maps_from_caldav (ecal.get_categories_list ()));
-        } else {
-            labels = get_caldav_categories (ecal.get_categories_list ());
+        // Prefer explicit section id when available.
+        if (x_section_id != null && x_section_id != "") {
+            var sec_by_id = Services.Store.instance ().get_section (x_section_id);
+            if (sec_by_id != null) {
+                section_id = sec_by_id.id;
+            }
         }
-        #endif
+
+        if ((section_id == null || section_id == "") && x_section_name != null && x_section_name != "") {
+            var store = Services.Store.instance ();
+            var found_section = store.get_section_by_name (project_id, x_section_name);
+            if (found_section == null) {
+                found_section = new Objects.Section ();
+                found_section.id = Util.get_default ().generate_id (found_section);
+                found_section.name = x_section_name;
+                found_section.project_id = project_id;
+                found_section.color = (x_section_color != null && x_section_color != "") ? x_section_color : Util.get_default ().get_random_color ();
+                if (project != null) {
+                    project.add_section_if_not_exists (found_section);
+                } else {
+                    store.insert_section (found_section);
+                }
+            }
+            section_id = found_section.id;
+        }
+
+        if (x_item_type != null && x_item_type != "") {
+            if (x_item_type == "note") {
+                item_type = ItemType.NOTE;
+            } else if (x_item_type.down ().strip () == "section" || (x_planify_type != null && x_planify_type.down ().strip () == "section")) {
+                /* Real section VTODOs should be merged via CalDAV ensure_section_from_vtodo; if parsed as Item, keep TASK to avoid NOTE mis-map. */
+                item_type = ItemType.TASK;
+            } else {
+                item_type = ItemType.TASK;
+            }
+        } else if (x_planify_type != null && x_planify_type.down ().strip () == "section") {
+            item_type = ItemType.TASK;
+        } else {
+            item_type = ItemType.TASK;
+        }
+
+        if (x_deadline != null && x_deadline != "") {
+            deadline_date = x_deadline;
+        } else {
+            deadline_date = "";
+        }
+
+        // Parse Attachments (Planify custom + standard ATTACH)
+        if (is_update) {
+            attachments.clear ();
+        }
+        foreach (string payload in planify_attach_payloads) {
+            if (payload != null && payload != "") {
+                string[] parts = payload.split ("|");
+                if (parts.length == 4) {
+                    var new_attach = new Objects.Attachment ();
+                    new_attach.id = parts[0];
+                    new_attach.item_id = id;
+                    new_attach.file_name = parts[1];
+                    new_attach.file_type = parts[2];
+                    new_attach.file_path = parts[3];
+                    if (is_update) {
+                        attachments.add (new_attach);
+                    }
+                    Services.Store.instance ().insert_attachment (new_attach);
+                }
+            }
+        }
+
+        ICal.Property ? std_attach_prop = ical_vtodo.get_first_property (ICal.PropertyKind.ATTACH_PROPERTY);
+        while (std_attach_prop != null) {
+            var attach_url = std_attach_prop.get_value_as_string ();
+            if (attach_url != null && attach_url != "") {
+                var new_attach = new Objects.Attachment ();
+                new_attach.id = Util.get_default ().generate_id (null);
+                new_attach.item_id = id;
+                new_attach.file_path = attach_url;
+                new_attach.file_name = GLib.Path.get_basename (attach_url);
+                
+                if (is_update) {
+                    attachments.add (new_attach);
+                }
+                Services.Store.instance ().insert_attachment (new_attach);
+            }
+            std_attach_prop = ical_vtodo.get_next_property (ICal.PropertyKind.ATTACH_PROPERTY);
+        }
+
+        string etag_keep = remote_etag != null && remote_etag != ""
+            ? remote_etag
+            : Util.get_etag_from_extra_data (extra_data);
+        extra_data = Util.generate_extra_data (_ical_url, etag_keep, ical.as_ical_string ());
+
+        // Native Labels Sync (No Evolution dependency)
+        var categories_property = ical_vtodo.get_first_property (ICal.PropertyKind.CATEGORIES_PROPERTY);
+        if (categories_property != null) {
+            var categories_str = categories_property.get_categories ();
+            if (categories_str != null && categories_str != "") {
+                var categories_list = new GLib.SList<string> ();
+                foreach (var category in categories_str.split (",")) {
+                    categories_list.append (category.strip ());
+                }
+                
+                if (is_update) {
+                    check_labels (get_labels_maps_from_caldav (categories_list));
+                } else {
+                    labels = get_caldav_categories (categories_list);
+                }
+            }
+        } else if (is_update) {
+            check_labels (new Gee.HashMap<string, Objects.Label> ());
+        }
+
+        // Parse Reminders (VALARM)
+        if (is_update) {
+            var old_rem = Services.Store.instance ().get_reminders_by_item (this);
+            foreach (var er in old_rem) {
+                Services.Store.instance ().delete_reminder (er);
+            }
+        }
+        ICal.Component ? alarm = ical_vtodo.get_first_component (ICal.ComponentKind.VALARM_COMPONENT);
+        while (alarm != null) {
+            ICal.Property ? trigger_prop = alarm.get_first_property (ICal.PropertyKind.TRIGGER_PROPERTY);
+            if (trigger_prop != null) {
+                var new_reminder = new Objects.Reminder ();
+                new_reminder.id = Util.get_default ().generate_id (null);
+                new_reminder.item_id = id;
+
+                var trigger_str = normalize_valarm_trigger_value (trigger_prop.get_value_as_string ());
+                if (trigger_str != null && (trigger_str.has_prefix ("P") || trigger_str.has_prefix ("-P"))) {
+                    new_reminder.reminder_type = ReminderType.RELATIVE;
+                    if (trigger_str.contains ("M")) {
+                        var minutes_part = trigger_str.replace ("-PT", "").replace ("PT", "").replace ("M", "");
+                        new_reminder.mm_offset = int.parse (minutes_part);
+                    }
+                } else {
+                    new_reminder.reminder_type = ReminderType.ABSOLUTE;
+                    if (trigger_str != null && trigger_str != "") {
+                        var trigger_time = ICal.Time.from_string (trigger_str);
+                        if (!trigger_time.is_null_time ()) {
+                            new_reminder.due.datetime = Utils.Datetime.ical_to_date_time_local (trigger_time);
+                        }
+                    }
+                }
+                
+                Services.Store.instance ().insert_reminder (new_reminder);
+            }
+            alarm = ical_vtodo.get_next_component (ICal.ComponentKind.VALARM_COMPONENT);
+        }
         // TODO: Reimplement without ECAL
+    }
+
+    private string? normalize_valarm_trigger_value (string? raw) {
+        if (raw == null || raw == "") {
+            return raw;
+        }
+        string t = raw.strip ();
+        try {
+            var re = new Regex ("-?PT\\d+[HMS]", RegexCompileFlags.CASELESS);
+            MatchInfo mi;
+            if (re.match (t, 0, out mi)) {
+                return mi.fetch (0);
+            }
+        } catch (Error e) {
+        }
+        long last_colon = t.last_index_of (":");
+        if (last_colon >= 0 && last_colon < (long) t.length - 1) {
+            string tail = t.substring ((ssize_t) (last_colon + 1)).strip ();
+            if (tail != "") {
+                return tail;
+            }
+        }
+        return t;
     }
 
     private Gee.ArrayList<Objects.Label> get_caldav_categories (GLib.SList<string> categories_list) {
@@ -728,12 +950,20 @@ public class Objects.Item : Objects.BaseObject {
             GLib.Source.remove (update_timeout_id);
         }
 
+        if (project.source_type == SourceType.CALDAV) {
+            needs_push = true;
+            Services.Store.instance ().update_item (this, update_id);
+        }
+
         update_timeout_id = Timeout.add (Constants.UPDATE_TIMEOUT, () => {
             update_timeout_id = 0;
 
-            if (project.source_type == SourceType.LOCAL) {
+            if (project.source_type != SourceType.CALDAV) {
+                // Optimistic local update
                 Services.Store.instance ().update_item (this, update_id);
-            } else if (project.source_type == SourceType.TODOIST) {
+            }
+
+            if (project.source_type == SourceType.TODOIST) {
                 Services.Todoist.get_default ().update.begin (this, (obj, res) => {
                     Services.Todoist.get_default ().update.end (res);
                     Services.Store.instance ().update_item (this, update_id);
@@ -744,6 +974,7 @@ public class Objects.Item : Objects.BaseObject {
                     HttpResponse response = caldav_client.add_item.end (res);
 
                     if (response.status) {
+                        needs_push = false;
                         Services.Store.instance ().update_item (this, update_id);
                     }
                 });
@@ -758,12 +989,21 @@ public class Objects.Item : Objects.BaseObject {
             GLib.Source.remove (update_timeout_id);
         }
 
+        if (project.source_type == SourceType.CALDAV) {
+            needs_push = true;
+            Services.Store.instance ().update_item (this, update_id);
+        }
+
         update_timeout_id = Timeout.add (Constants.UPDATE_TIMEOUT, () => {
             update_timeout_id = 0;
             loading = true;
 
-            if (project.source_type == SourceType.LOCAL) {
+            if (project.source_type != SourceType.CALDAV) {
+                // Optimistic local update
                 Services.Store.instance ().update_item (this, update_id);
+            }
+
+            if (project.source_type == SourceType.LOCAL) {
                 loading = false;
             } else if (project.source_type == SourceType.TODOIST) {
                 Services.Todoist.get_default ().update.begin (this, (obj, res) => {
@@ -777,6 +1017,7 @@ public class Objects.Item : Objects.BaseObject {
                     HttpResponse response = caldav_client.add_item.end (res);
 
                     if (response.status) {
+                        needs_push = false;
                         Services.Store.instance ().update_item (this, update_id);
                     }
 
@@ -791,8 +1032,13 @@ public class Objects.Item : Objects.BaseObject {
     public void update_async (string update_id = "") {
         loading = true;
 
+        if (project.source_type == SourceType.CALDAV) {
+            needs_push = true;
+        }
+        // Optimistic local update
+        Services.Store.instance ().update_item (this, update_id);
+
         if (project.source_type == SourceType.LOCAL) {
-            Services.Store.instance ().update_item (this, update_id);
             loading = false;
         } else if (project.source_type == SourceType.TODOIST) {
             Services.Todoist.get_default ().update.begin (this, (obj, res) => {
@@ -806,6 +1052,7 @@ public class Objects.Item : Objects.BaseObject {
                 HttpResponse response = caldav_client.add_item.end (res);
 
                 if (response.status) {
+                    needs_push = false;
                     Services.Store.instance ().update_item (this, update_id);
                 }
 
@@ -822,12 +1069,15 @@ public class Objects.Item : Objects.BaseObject {
     private void _update_pin () {
         if (project.source_type == SourceType.CALDAV) {
             loading = true;
+            needs_push = true;
+            Services.Store.instance ().update_item (this, "");
             var caldav_client = Services.CalDAV.Core.get_default ().get_client (project.source);
             caldav_client.add_item.begin (this, true, (obj, res) => {
                 HttpResponse response = caldav_client.add_item.end (res);
 
                 if (response.status) {
-                    Services.Store.instance ().update_item_pin (this);
+                    needs_push = false;
+                    Services.Store.instance ().update_item (this, "");
                 }
 
                 loading = false;
@@ -1206,8 +1456,25 @@ public class Objects.Item : Objects.BaseObject {
         return generator.to_data (null);
     }
 
+    /** RFC 5545 TEXT escaping for DESCRIPTION and similar properties. */
+    static string escape_ical_text_value (string text) {
+        var sb = new StringBuilder ();
+        for (long i = 0; i < text.char_count (); i++) {
+            unichar c = text.get_char (text.index_of_nth_char (i));
+            if (c == '\\' || c == ';' || c == ',') {
+                sb.append_c ('\\');
+                sb.append_unichar (c);
+            } else if (c == '\n') {
+                sb.append ("\\n");
+            } else if (c != '\r') {
+                sb.append_unichar (c);
+            }
+        }
+        return sb.str;
+    }
+
     public string to_vtodo () {
-        ICal.Component ical = new ICal.Component.vtodo ();
+        ICal.Component ical = new ICal.Component (ICal.ComponentKind.VTODO_COMPONENT);
 
         ical.set_uid (id);
         ical.set_dtstamp (new ICal.Time.current_with_zone (ICal.Timezone.get_utc_timezone ()));
@@ -1282,7 +1549,7 @@ public class Objects.Item : Objects.BaseObject {
                         }
                     }
 
-                    rrule.set_by_day_array (values);
+                    rrule.set_by_array (ICal.RecurrenceByRule.BY_DAY, values);
                 } else if (due.recurrency_type == RecurrencyType.EVERY_MONTH) {
                     rrule.set_freq (ICal.RecurrenceFrequency.MONTHLY_RECURRENCE);
                 } else if (due.recurrency_type == RecurrencyType.EVERY_YEAR) {
@@ -1347,6 +1614,73 @@ public class Objects.Item : Objects.BaseObject {
         child_order_property.set_x_name ("X-APPLE-SORT-ORDER");
         child_order_property.set_x (child_order.to_string ());
         ical.add_property (child_order_property);
+
+        var pinned_property = new ICal.Property (ICal.PropertyKind.X_PROPERTY);
+        pinned_property.set_x_name ("X-PINNED");
+        pinned_property.set_x (pinned.to_string ());
+        ical.add_property (pinned_property);
+
+        if (has_section && section != null) {
+            var section_id_property = new ICal.Property (ICal.PropertyKind.X_PROPERTY);
+            section_id_property.set_x_name ("X-PLANIFY-SECTION-ID");
+            section_id_property.set_x (section.id);
+            ical.add_property (section_id_property);
+
+            var section_name_property = new ICal.Property (ICal.PropertyKind.X_PROPERTY);
+            section_name_property.set_x_name ("X-PLANIFY-SECTION-NAME");
+            section_name_property.set_x (section.name);
+            ical.add_property (section_name_property);
+
+            var section_color_property = new ICal.Property (ICal.PropertyKind.X_PROPERTY);
+            section_color_property.set_x_name ("X-PLANIFY-SECTION-COLOR");
+            section_color_property.set_x (section.color);
+            ical.add_property (section_color_property);
+        }
+
+        var item_type_property = new ICal.Property (ICal.PropertyKind.X_PROPERTY);
+        item_type_property.set_x_name ("X-PLANIFY-ITEM-TYPE");
+        item_type_property.set_x (item_type.to_string ());
+        ical.add_property (item_type_property);
+
+        if (has_deadline) {
+            var deadline_property = new ICal.Property (ICal.PropertyKind.X_PROPERTY);
+            deadline_property.set_x_name ("X-PLANIFY-DEADLINE");
+            deadline_property.set_x (deadline_date);
+            ical.add_property (deadline_property);
+        }
+
+        foreach (var attachment in attachments) {
+            var attach_property = new ICal.Property.attach (new ICal.Attach.from_url (attachment.file_path));
+            ical.add_property (attach_property);
+        }
+
+        foreach (var reminder in reminders) {
+            if (reminder.is_deleted != 0) {
+                continue;
+            }
+
+            string alarm_desc = (content != null && content.strip () != "") ? content : _("Reminder");
+            alarm_desc = escape_ical_text_value (alarm_desc);
+
+            var alarm_sb = new StringBuilder ();
+            alarm_sb.append ("BEGIN:VALARM\r\n");
+            alarm_sb.append ("ACTION:DISPLAY\r\n");
+            alarm_sb.append_printf ("DESCRIPTION:%s\r\n", alarm_desc);
+
+            if (reminder.reminder_type == ReminderType.RELATIVE) {
+                int mm = reminder.mm_offset > 0 ? reminder.mm_offset : 0;
+                alarm_sb.append_printf ("TRIGGER:-PT%dM\r\n", mm);
+            } else if (reminder.due != null && reminder.due.date != "" && reminder.due.datetime != null) {
+                var dt_utc = reminder.due.datetime.to_utc ();
+                alarm_sb.append_printf ("TRIGGER;VALUE=DATE-TIME:%s\r\n", dt_utc.format ("%Y%m%dT%H%M%SZ"));
+            } else {
+                alarm_sb.append ("TRIGGER:-PT0S\r\n");
+            }
+
+            alarm_sb.append ("END:VALARM");
+            var alarm = new ICal.Component.from_string (alarm_sb.str);
+            ical.add_component (alarm);
+        }
 
         return "%s%s%s".printf (
             "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//Planify App (https://github.com/alainm23/planify)\n",

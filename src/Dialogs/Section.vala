@@ -180,6 +180,21 @@ public class Dialogs.Section : Adw.Dialog {
             return;
         }
 
+        if (section.project.source_type == SourceType.CALDAV) {
+            Services.Store.instance ().update_section (section);
+
+            // Push updated VTODOs for all items in this section so other clients
+            // pick up the new section name/color via X-PLANIFY-SECTION-NAME.
+            var caldav_client = Services.CalDAV.Core.get_default ().get_client (section.project.source);
+            submit_button.is_loading = true;
+
+            push_section_items.begin (caldav_client, (obj, res) => {
+                submit_button.is_loading = false;
+                close ();
+            });
+
+            return;
+        }
 
         if (section.project.source_type == SourceType.TODOIST) {
             submit_button.is_loading = true;
@@ -211,6 +226,18 @@ public class Dialogs.Section : Adw.Dialog {
             return;
         }
 
+        if (section.project.source_type == SourceType.CALDAV) {
+            section.id = Util.get_default ().generate_id (section);
+            section.project.add_section_if_not_exists (section);
+            var caldav_client = Services.CalDAV.Core.get_default ().get_client (section.project.source);
+            caldav_client.put_section_calendar.begin (section, section.project, (obj, res) => {
+                caldav_client.put_section_calendar.end (res);
+            });
+            send_toast (_("Section added"));
+            close ();
+            return;
+        }
+
         if (section.project.source_type == SourceType.TODOIST) {
             submit_button.is_loading = true;
             Services.Todoist.get_default ().add.begin (section, (obj, res) => {
@@ -227,6 +254,15 @@ public class Dialogs.Section : Adw.Dialog {
                     close ();
                 }
             });
+        }
+    }
+
+    private async void push_section_items (Services.CalDAV.CalDAVClient caldav_client) {
+        yield caldav_client.put_section_calendar (section, section.project);
+        foreach (var item in section.items) {
+            if (item.ical_url != null && item.ical_url != "") {
+                yield caldav_client.add_item (item, true);
+            }
         }
     }
 

@@ -45,7 +45,7 @@ public class Layouts.ItemRow : Layouts.ItemBase {
     private Widgets.ContextMenu.MenuSwitch use_note_item;
     private Gtk.Box content_box;
 
-    #if WITH_LIBSPELLING
+    #if WITH_LIBSPELLING && !IS_WINDOWS
     private Spelling.TextBufferAdapter? spelling_adapter = null;
     #endif
 
@@ -527,7 +527,7 @@ public class Layouts.ItemRow : Layouts.ItemBase {
         signals_map[detail_revealer.notify["reveal-child"].connect (() => {
             if (detail_revealer.reveal_child) {
                 build_detail_widgets ();
-                #if WITH_LIBSPELLING
+                #if WITH_LIBSPELLING && !IS_WINDOWS
                 init_spelling_adapter ();
                 #endif
             }
@@ -2100,7 +2100,7 @@ public class Layouts.ItemRow : Layouts.ItemBase {
         })] = attachments;
     }
 
-    #if WITH_LIBSPELLING
+    #if WITH_LIBSPELLING && !IS_WINDOWS
     private void init_spelling_adapter () {
         if (spelling_adapter != null) return;
 

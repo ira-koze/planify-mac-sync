@@ -211,6 +211,11 @@ public class Objects.Section : Objects.BaseObject {
                 Services.Todoist.get_default ().update.begin (this, (obj, res) => {
                     Services.Todoist.get_default ().update.end (res);
                 });
+            } else if (project.source_type == SourceType.CALDAV && cloud) {
+                var caldav = Services.CalDAV.Core.get_default ().get_client (project.source);
+                caldav.put_section_calendar.begin (this, project, (o, res) => {
+                    caldav.put_section_calendar.end (res);
+                });
             }
 
             return GLib.Source.REMOVE;

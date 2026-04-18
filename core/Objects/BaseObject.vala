@@ -206,11 +206,19 @@ public class Objects.BaseObject : GLib.Object {
             }
 
             if (this is Objects.Section) {
-                return ((Objects.Section) this).project.source;
+                Objects.Project? p = ((Objects.Section) this).project;
+                if (p == null) {
+                    return null;
+                }
+                return p.source;
             }
 
             if (this is Objects.Item) {
-                return ((Objects.Item) this).project.source;
+                Objects.Project? p = ((Objects.Item) this).project;
+                if (p == null) {
+                    return null;
+                }
+                return p.source;
             }
 
             if (this is Objects.Label) {
@@ -218,7 +226,15 @@ public class Objects.BaseObject : GLib.Object {
             }
 
             if (this is Objects.Reminder) {
-                return ((Objects.Reminder) this).item.project.source;
+                Objects.Item? it = ((Objects.Reminder) this).item;
+                if (it == null) {
+                    return null;
+                }
+                Objects.Project? p = it.project;
+                if (p == null) {
+                    return null;
+                }
+                return p.source;
             }
 
             return _source;

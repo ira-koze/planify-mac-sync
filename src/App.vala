@@ -53,7 +53,7 @@ public class Planify : Adw.Application {
     public Planify () {
         Object (
             application_id : Build.APPLICATION_ID,
-            flags: ApplicationFlags.HANDLES_OPEN
+            flags: ApplicationFlags.HANDLES_OPEN | ApplicationFlags.NON_UNIQUE
         );
     }
 
@@ -253,6 +253,8 @@ public class Planify : Adw.Application {
     }
 
     public static int main (string[] args) {
+        GLib.Environment.set_variable ("XDG_DATA_DIRS", "/opt/homebrew/share:" + (GLib.Environment.get_variable ("XDG_DATA_DIRS") ?? "/usr/share"), true);
+        GLib.Environment.set_variable ("GSETTINGS_SCHEMA_DIR", "/opt/homebrew/share/glib-2.0/schemas", true);
         Planify app = Planify.instance;
         return app.run (args);
     }

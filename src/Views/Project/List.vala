@@ -208,8 +208,12 @@ public class Views.List : Adw.Bin {
             Layouts.SectionRow item1 = ((Layouts.SectionRow) row1);
             Layouts.SectionRow item2 = ((Layouts.SectionRow) row2);
 
-            if (item1.is_inbox_section) {
+            if (item1.is_inbox_section && item2.is_inbox_section) {
                 return 0;
+            } else if (item1.is_inbox_section) {
+                return -1;
+            } else if (item2.is_inbox_section) {
+                return 1;
             }
 
             return item1.section.section_order - item2.section.section_order;
@@ -256,6 +260,17 @@ public class Views.List : Adw.Bin {
         signal_map[project.source.sync_finished.connect (() => {
             listbox.invalidate_sort ();
         })] = project.source;
+
+        signal_map[project.section_added.connect ((section) => {
+            add_section (section);
+            listbox.invalidate_sort ();
+        })] = project;
+
+        signal_map[Services.Store.instance ().item_updated.connect ((item) => {
+            if (project.id == item.project_id) {
+                listbox.invalidate_sort ();
+            }
+        })] = Services.Store.instance ();
 
         signal_map[Services.EventBus.get_default ().dim_content.connect ((active, focused_item_id) => {
             title_box.sensitive = !active;

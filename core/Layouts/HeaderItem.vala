@@ -286,10 +286,28 @@ public class Layouts.HeaderItem : Adw.Bin {
     }
 
     public void add_child (Gtk.Widget widget) {
+        unowned Gtk.Widget? p = widget.get_parent ();
+        if (p == listbox) {
+            return;
+        }
+
+        if (p != null) {
+            widget.unparent ();
+        }
+
         listbox.append (widget);
     }
 
     public void insert_child (Gtk.Widget widget, int position) {
+        unowned Gtk.Widget? p = widget.get_parent ();
+        if (p == listbox) {
+            return;
+        }
+
+        if (p != null) {
+            widget.unparent ();
+        }
+
         listbox.insert (widget, position);
     }
 
@@ -304,6 +322,15 @@ public class Layouts.HeaderItem : Adw.Bin {
     }
 
     public void add_widget_end (Gtk.Widget widget) {
+        unowned Gtk.Widget? p = widget.get_parent ();
+        if (p == action_box) {
+            return;
+        }
+
+        if (p != null) {
+            widget.unparent ();
+        }
+
         action_box.append (widget);
     }
 

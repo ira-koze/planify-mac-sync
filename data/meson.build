@@ -32,6 +32,7 @@ appstream_file = i18n.merge_file(
   ),
   output: '@0@.metainfo.xml'.format(application_id),
   po_dir: join_paths(meson.project_source_root(), 'po'),
+  data_dirs: ['gettext-its'],
   install: true,
   install_dir: get_option('datadir') / 'metainfo',
 )

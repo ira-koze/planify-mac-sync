@@ -23,7 +23,6 @@ libadwaita_dep = dependency('libadwaita-1', version: '>= 1.7.0')
 json_dep = dependency('json-glib-1.0')
 libical_dep = dependency('libical-glib')
 libgxml_dep = dependency('gxml-0.20')
-libsecret_dep = dependency('libsecret-1')
 libspelling = dependency('libspelling-1', required: get_option('spelling'))
 gtksourceview_dep = dependency('gtksourceview-5')
 m_dep = meson.get_compiler('c').find_library('m', required : false)
@@ -143,5 +142,5 @@ summary({
 gnome.post_install(
   glib_compile_schemas: true,
   gtk_update_icon_cache: true,
-  update_desktop_database: true,
+  update_desktop_database: false,
 )

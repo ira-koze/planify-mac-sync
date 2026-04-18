@@ -196,15 +196,22 @@ public class Widgets.SubItems : Adw.Bin {
         })] = Services.Store.instance ();
 
         signal_map[Services.Store.instance ().item_pin_change.connect ((item) => {
-            // vala-lint=no-space
-            if (!item.pinned && item.parent_id == item_parent.id &&
-                !items_map.has_key (item.id)) {
-                add_item (item);
+            if (item.parent_id != item_parent.id) {
+                return;
             }
 
-            if (item.pinned && items_map.has_key (item.id)) {
-                items_map[item.id].hide_destroy ();
-                items_map.unset (item.id);
+            // Pin: remove from SubItems list unconditionally
+            if (item.pinned) {
+                if (items_map.has_key (item.id)) {
+                    items_map[item.id].hide_destroy ();
+                    items_map.unset (item.id);
+                    children_changes ();
+                }
+            }
+
+            // Unpin: add back to SubItems list (add_item guards against duplicates)
+            if (!item.pinned) {
+                add_item (item);
             }
         })] = Services.Store.instance ();
 

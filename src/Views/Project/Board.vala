@@ -170,8 +170,12 @@ public class Views.Board : Adw.Bin {
             Layouts.SectionBoard item1 = ((Layouts.SectionBoard) child1);
             Layouts.SectionBoard item2 = ((Layouts.SectionBoard) child2);
 
-            if (item1.is_inbox_section) {
+            if (item1.is_inbox_section && item2.is_inbox_section) {
                 return 0;
+            } else if (item1.is_inbox_section) {
+                return -1;
+            } else if (item2.is_inbox_section) {
+                return 1;
             }
 
             return item1.section.section_order - item2.section.section_order;

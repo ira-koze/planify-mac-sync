@@ -50,4 +50,37 @@ namespace Constants {
     public const bool BLOCK_PAST_DAYS = false;
     public const int COMPLETED_PAGE_SIZE = 15;
     public const int HEADERBAR_TITLE_SCROLL_THRESHOLD = 24;
+
+    /** Override path with `PLANIFY_AGENT_DEBUG_LOG`. Default: cache `io.github.alainm23.planify/debug-020cd6.log` */
+    public static string agent_debug_log_path () {
+        string? over = GLib.Environment.get_variable ("PLANIFY_AGENT_DEBUG_LOG");
+        if (over != null && over != "") {
+            return over;
+        }
+
+        return GLib.Path.build_filename (
+            GLib.Environment.get_user_cache_dir (),
+            "io.github.alainm23.planify",
+            "debug-020cd6.log"
+        );
+    }
+
+    public static void agent_debug_log_append_line (string line) {
+        try {
+            string path = agent_debug_log_path ();
+            var parent = GLib.File.new_for_path (path).get_parent ();
+            if (parent != null && !parent.query_exists ()) {
+                parent.make_directory_with_parents ();
+            }
+            FileStream? fs = FileStream.open (path, "a");
+            if (fs != null) {
+                fs.puts (line);
+                if (!line.has_suffix ("\n")) {
+                    fs.puts ("\n");
+                }
+                fs.flush ();
+            }
+        } catch (GLib.Error e) {
+        }
+    }
 }

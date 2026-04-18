@@ -27,6 +27,8 @@ public class Services.CalDAV.WebDAVClient : GLib.Object {
     protected string password;
     protected string base_url;
     protected bool ignore_ssl;
+    protected string _last_response_etag = "";
+    protected uint _last_http_status_code = 0;
 
 
     public WebDAVClient (Soup.Session session, string base_url, string username, string password, bool ignore_ssl = false) {
@@ -44,27 +46,43 @@ public class Services.CalDAV.WebDAVClient : GLib.Object {
     }
 
     public string get_absolute_url (string href) {
-        string abs_url = null;
-        try {
-            abs_url = GLib.Uri.resolve_relative (base_url, href, GLib.UriFlags.NONE).to_string ();
-        } catch (Error e) {
-            critical ("Failed to resolve relative url: %s", e.message);
+        if (href.strip () == "") {
+            warning ("get_absolute_url: empty href (base=%s)", base_url);
+            return null;
         }
-        return abs_url;
+
+        string h = href.strip ();
+        if (h.has_prefix ("http://") || h.has_prefix ("https://")) {
+            return h;
+        }
+
+        try {
+            return GLib.Uri.resolve_relative (base_url, h, GLib.UriFlags.NONE).to_string ();
+        } catch (Error e) {
+            warning ("Failed to resolve relative url (base=%s href=%s): %s", base_url, h, e.message);
+            return null;
+        }
     }
 
     public async WebDAVMultiStatus propfind (string url, string xml, string depth, GLib.Cancellable cancellable) throws GLib.Error {
-        return new WebDAVMultiStatus.from_string (yield send_request ("PROPFIND", url, "application/xml", xml, depth, cancellable, { Soup.Status.MULTI_STATUS }));
+        return new WebDAVMultiStatus.from_string (sanitize_xml_response (
+            yield send_request ("PROPFIND", url, "application/xml", xml, depth, cancellable, { Soup.Status.MULTI_STATUS })
+        ));
     }
 
     public async WebDAVMultiStatus report (string url, string xml, string depth, GLib.Cancellable cancellable) throws GLib.Error {
-        return new WebDAVMultiStatus.from_string (yield send_request ("REPORT", url, "application/xml", xml, depth, cancellable, { Soup.Status.MULTI_STATUS }));
+        return new WebDAVMultiStatus.from_string (sanitize_xml_response (
+            yield send_request ("REPORT", url, "application/xml", xml, depth, cancellable, { Soup.Status.MULTI_STATUS })
+        ));
     }
 
     protected async string send_request (string method, string url, string content_type, string? body, string? depth, GLib.Cancellable? cancellable, Soup.Status[] expected_statuses, HashTable<string,string>? extra_headers = null) throws GLib.Error {
         var abs_url = get_absolute_url (url);
         if (abs_url == null)
             throw new GLib.IOError.FAILED ("Invalid URL: %s".printf (url));
+
+        _last_response_etag = "";
+        _last_http_status_code = 0;
 
         var msg = new Soup.Message (method, abs_url);
         msg.request_headers.append ("User-Agent", Constants.SOUP_USER_AGENT);
@@ -83,11 +101,25 @@ public class Services.CalDAV.WebDAVClient : GLib.Object {
             return false;
         });
 
+        string effective_ct = content_type;
+        if (body != null && (effective_ct == null || effective_ct == "")) {
+            if (method == "PUT") {
+                effective_ct = "text/calendar; charset=utf-8";
+            } else if (method == "PROPPATCH") {
+                effective_ct = "application/xml";
+            } else {
+                effective_ct = "application/octet-stream";
+            }
+        }
+        if (body != null && method == "PUT" && effective_ct != null && !effective_ct.contains ("charset")) {
+            effective_ct = "%s; charset=utf-8".printf (effective_ct);
+        }
+
         // After authentication, the body of the message needs to be set again when the message is resent.
         // https://gitlab.gnome.org/GNOME/libsoup/-/issues/358
         msg.restarted.connect (() => {
             if (body != null) {
-                msg.set_request_body_from_bytes (content_type, new GLib.Bytes (body.data));
+                msg.set_request_body_from_bytes (effective_ct, new GLib.Bytes (body.data));
             }
         });
 
@@ -107,7 +139,14 @@ public class Services.CalDAV.WebDAVClient : GLib.Object {
         }
 
         if (body != null) {
-            msg.set_request_body_from_bytes (content_type, new GLib.Bytes (body.data));
+            msg.set_request_body_from_bytes (effective_ct, new GLib.Bytes (body.data));
+        }
+
+        try {
+            if (effective_ct != null) {
+                msg.request_headers.replace ("Content-Type", effective_ct);
+            }
+        } catch (Error e) {
         }
 
         GLib.Bytes response;
@@ -118,6 +157,12 @@ public class Services.CalDAV.WebDAVClient : GLib.Object {
                 throw e;
             }
             throw new GLib.IOError.FAILED ("Request failed: %s".printf (e.message));
+        }
+
+        _last_http_status_code = msg.status_code;
+        string? etag_hdr = msg.response_headers.get_one ("ETag");
+        if (etag_hdr != null) {
+            _last_response_etag = etag_hdr;
         }
 
         bool ok = false;
@@ -136,10 +181,69 @@ public class Services.CalDAV.WebDAVClient : GLib.Object {
             );
         }
 
-        var response_data = response.get_data ();
-        response_data += '\0';
+        var response_text = (string) response.get_data ();
 
-        return (string) response_data;
+        if (method == "PUT" || method == "PROPPATCH") {
+            stderr.printf ("[CalDAV] %s %s -> HTTP %u %s\n", method, abs_url, msg.status_code, msg.reason_phrase ?? "");
+            if (body != null) {
+                stderr.printf ("[CalDAV] Request body:\n%s\n", body);
+            }
+            stderr.printf ("[CalDAV] Response body:\n%s\n", response_text);
+        }
+
+        return response_text;
+    }
+
+    /**
+     * Strips junk after the first well-formed WebDAV XML document (e.g. stray bytes after </D:multistatus>).
+     * RFC 4918 (WebDAV XML), RFC 4791 (CalDAV).
+     */
+    protected string sanitize_xml_response (string response_text) {
+        string cleaned = response_text.replace ("\0", "");
+
+        int xml_start = cleaned.index_of ("<?xml");
+        if (xml_start < 0) {
+            xml_start = cleaned.index_of ("<D:multistatus");
+            if (xml_start < 0) {
+                xml_start = cleaned.index_of ("<d:multistatus");
+            }
+            if (xml_start < 0) {
+                xml_start = 0;
+            }
+        }
+
+        int end = find_last_closing_multistatus_gt (cleaned, xml_start);
+        if (end >= xml_start) {
+            return cleaned.substring (xml_start, end - xml_start + 1).strip ();
+        }
+
+        int xml_end = cleaned.last_index_of_char ('>');
+        if (xml_end >= 0 && xml_end >= xml_start) {
+            return cleaned.substring (xml_start, xml_end - xml_start + 1).strip ();
+        }
+
+        return cleaned.strip ();
+    }
+
+    private int find_last_closing_multistatus_gt (string s, int start) {
+        int found = -1;
+        int pos = start;
+        while (true) {
+            int lt = s.index_of ("</", pos);
+            if (lt < 0) {
+                break;
+            }
+            int gt = s.index_of (">", lt + 2);
+            if (gt < 0) {
+                break;
+            }
+            string inner = s.substring (lt + 2, gt - (lt + 2));
+            if (inner.strip ().down ().has_suffix ("multistatus")) {
+                found = gt;
+            }
+            pos = lt + 2;
+        }
+        return found;
     }
 
 }

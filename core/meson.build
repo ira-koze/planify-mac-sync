@@ -6,6 +6,7 @@ core_files = files(
     'Utils/Util.vala',
     'Utils/Datetime.vala',
     'Utils/MarkdownProcessor.vala',
+    'Utils/macos_theme.c',
 
     'Services/Settings.vala',
     'Services/EventBus.vala',
@@ -147,9 +148,9 @@ core_deps = [
   libsoup_dep,
   libical_dep,
   libgxml_dep,
-  libsecret_dep,
   libspelling,
-  gtksourceview_dep
+  gtksourceview_dep,
+  dependency('appleframeworks', modules: 'CoreFoundation')
 ]
 
 if get_option('evolution')
