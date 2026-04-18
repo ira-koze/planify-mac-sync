@@ -10,6 +10,7 @@ core_files = files(
 
     'Services/Settings.vala',
     'Services/EventBus.vala',
+    'Services/AppErrors.vala',
     'Services/Database.vala',
     'Services/Store.vala',
     'Services/Todoist.vala',
@@ -18,6 +19,7 @@ core_files = files(
     'Services/CalDAV/Core.vala',
     'Services/CalDAV/CalDAVClient.vala',
     'Services/CalDAV/WebDAVClient.vala',
+    'Services/CalDAV/ICalValidator.vala',
     'Services/CalDAV/Providers/Nextcloud.vala',
 
     'Services/Chrono/Chrono.vala',
@@ -110,6 +112,7 @@ core_files = files(
     'Objects/Section.vala',
     'Objects/Promise.vala',
     'Objects/Attachment.vala',
+    'Objects/AppError.vala',
     'Objects/ObjectEvent.vala',
     'Objects/Source.vala',
     'Objects/TranslationMetric.vala',

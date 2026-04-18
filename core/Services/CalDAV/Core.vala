@@ -22,6 +22,7 @@
 public class Services.CalDAV.Core : GLib.Object {
 
     private Gee.HashMap<string, Services.CalDAV.CalDAVClient> clients;
+    private Gee.HashSet<string> syncing_sources = new Gee.HashSet<string> ();
 
     public signal void sync_progress (int current, int total, string message);
 
@@ -36,6 +37,30 @@ public class Services.CalDAV.Core : GLib.Object {
 
     public Core () {
         clients = new Gee.HashMap<string, Services.CalDAV.CalDAVClient> ();
+    }
+
+    private static string debug_json_escape (string? s) {
+        if (s == null) {
+            return "";
+        }
+        return s.replace ("\\", "\\\\").replace ("\"", "\\\"").replace ("\r", "\\r").replace ("\n", "\\n");
+    }
+
+    private static void debug_agent_log (string run_id, string hypothesis_id, string location, string message, string data_json = "{}") {
+        try {
+            int64 ts = GLib.get_real_time () / 1000;
+            string line = "{\"sessionId\":\"020cd6\",\"runId\":\"%s\",\"hypothesisId\":\"%s\",\"location\":\"%s\",\"message\":\"%s\",\"data\":%s,\"timestamp\":%lld}\n".printf (
+                debug_json_escape (run_id),
+                debug_json_escape (hypothesis_id),
+                debug_json_escape (location),
+                debug_json_escape (message),
+                data_json,
+                ts
+            );
+            Constants.agent_debug_log_append_line (line);
+        } catch (Error e) {
+            // no-op for debug instrumentation
+        }
     }
 
 
@@ -270,12 +295,40 @@ public class Services.CalDAV.Core : GLib.Object {
 
 
     public async void sync (Objects.Source source) {
+        if (syncing_sources.contains (source.id)) {
+            // #region agent log
+            debug_agent_log (
+                "initial",
+                "H6",
+                "CalDAV.Core.sync",
+                "Sync request skipped because source sync already in progress",
+                """{"sourceId":"%s","sourceName":"%s"}""".printf (debug_json_escape (source.id), debug_json_escape (source.display_name))
+            );
+            // #endregion
+            return;
+        }
+        syncing_sources.add (source.id);
+
         var caldav_client = get_client (source);
 
         source.sync_started ();
+        if (Constants.debug_caldav_http ()) {
+            Constants.log_debug_http ("[Agent Marker 020cd6] Core.sync instrumentation active\n");
+        }
+        // #region agent log
+        debug_agent_log (
+            "initial",
+            "H6",
+            "CalDAV.Core.sync",
+            "Source sync started",
+            """{"sourceId":"%s","sourceName":"%s"}""".printf (debug_json_escape (source.id), debug_json_escape (source.display_name))
+        );
+        // #endregion
 
         try {
             var cancellable = new GLib.Cancellable ();
+            /* Snapshot sync-tokens before caldav_client.sync() — that PROPFIND refreshes every
+             * project's sync_id; sync_tasklist needs this value for sync-collection deltas. */
             var sync_token_at_sync_start = new Gee.HashMap<string, string> ();
             foreach (Objects.Project p in Services.Store.instance ().get_projects_by_source (source.id)) {
                 sync_token_at_sync_start[p.id] = p.sync_id;
@@ -285,18 +338,84 @@ public class Services.CalDAV.Core : GLib.Object {
 
             foreach (Objects.Project project in Services.Store.instance ().get_projects_by_source (source.id)) {
                 try {
+                    // #region agent log
+                    debug_agent_log (
+                        "initial",
+                        "H6",
+                        "CalDAV.Core.sync",
+                        "sync_tasklist begin",
+                        """{"sourceId":"%s","projectId":"%s","projectName":"%s"}""".printf (
+                            debug_json_escape (source.id),
+                            debug_json_escape (project.id),
+                            debug_json_escape (project.name)
+                        )
+                    );
+                    // #endregion
                     string tok_before = sync_token_at_sync_start.has_key (project.id) ? sync_token_at_sync_start[project.id] : "";
                     yield caldav_client.sync_tasklist (project, cancellable, tok_before);
+                    // #region agent log
+                    debug_agent_log (
+                        "initial",
+                        "H6",
+                        "CalDAV.Core.sync",
+                        "sync_tasklist success",
+                        """{"sourceId":"%s","projectId":"%s","projectName":"%s"}""".printf (
+                            debug_json_escape (source.id),
+                            debug_json_escape (project.id),
+                            debug_json_escape (project.name)
+                        )
+                    );
+                    // #endregion
                 } catch (Error e) {
+                    // #region agent log
+                    debug_agent_log (
+                        "initial",
+                        "H6",
+                        "CalDAV.Core.sync",
+                        "sync_tasklist failed",
+                        """{"sourceId":"%s","projectId":"%s","projectName":"%s","error":"%s"}""".printf (
+                            debug_json_escape (source.id),
+                            debug_json_escape (project.id),
+                            debug_json_escape (project.name),
+                            debug_json_escape (e.message)
+                        )
+                    );
+                    // #endregion
                     warning ("CalDAV: sync_tasklist failed for project \"%s\" (%s): %s", project.name, project.id, e.message);
                 }
             }
 
-            source.sync_finished ();
-            source.last_sync = new GLib.DateTime.now_local ().to_string ();
+            GLib.Idle.add (() => {
+                // #region agent log
+                debug_agent_log (
+                    "initial",
+                    "H6",
+                    "CalDAV.Core.sync",
+                    "Source sync finished",
+                    """{"sourceId":"%s"}""".printf (debug_json_escape (source.id))
+                );
+                // #endregion
+                syncing_sources.remove (source.id);
+                source.sync_finished ();
+                source.last_sync = new GLib.DateTime.now_local ().to_string ();
+                return GLib.Source.REMOVE;
+            });
         } catch (Error e) {
+            // #region agent log
+            debug_agent_log (
+                "initial",
+                "H6",
+                "CalDAV.Core.sync",
+                "Source sync failed",
+                """{"sourceId":"%s","error":"%s"}""".printf (debug_json_escape (source.id), debug_json_escape (e.message))
+            );
+            // #endregion
             warning ("Failed to sync: %s", e.message);
-            source.sync_failed ();
+            GLib.Idle.add (() => {
+                syncing_sources.remove (source.id);
+                source.sync_failed ();
+                return GLib.Source.REMOVE;
+            });
         }
     }
 }

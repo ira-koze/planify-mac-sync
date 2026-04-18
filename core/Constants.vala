@@ -20,38 +20,73 @@
  */
 
 namespace Constants {
-    public const string SOUP_USER_AGENT = "Planify";
-    public const string TODOIST_CLIENT_ID = "b0dd7d3714314b1dbbdab9ee03b6b432";
-    public const string TODOIST_CLIENT_SECRET = "a86dfeb12139459da3e5e2a8c197c678";
-    public const string TODOIST_SCOPE = "data:read_write,data:delete,project:delete";
-    public const string TODOIST_REDIRECT_URI = "planify://auth";
-    public const string BACKUP_VERSION = "2.0";
-    public const int UPDATE_TIMEOUT = 1500;
-    public const int DESTROY_TIMEOUT = 750;
-    public const int STARTUP_SYNC_TIMEOUT = 2500;
-    public const int SHORT_NAME_SIZE = 20;
-    public const int PRIORITY_1 = 4;
-    public const int PRIORITY_2 = 3;
-    public const int PRIORITY_3 = 2;
-    public const int PRIORITY_4 = 1;
-    public const int SCROLL_STEPS = 6;
-    public const string TWITTER_URL = "https://twitter.com/useplanify";
-    public const string CONTACT_US = "alainmh23@gmail.com";
-    public const string PATREON_URL = "https://www.patreon.com/join/alainm23";
-    public const string PAYPAL_ME_URL = "https://www.paypal.com/paypalme/alainm23";
-    public const string LIBERAPAY_URL = "https://liberapay.com/Alain/";
-    public const string KOFI_URL = "https://ko-fi.com/alainm23";
-    public const string MASTODON_URL = "https://mastodon.social/@planifyapp";
-    public const string DISCORD_URL = "https://discord.com/invite/dxxyumrTJW";
-    public const string ISSUE_URL = "https://github.com/alainm23/planify/issues";
-    public const string WEBLATE_URL = "https://hosted.weblate.org/engage/planner/";
-    public const string FLATHUB_URL = "https://flathub.org/apps/io.github.alainm23.planify";
-    public const string PRIVACY_POLICY_URL = "https://useplanify.com/privacy-policy/";
-    public const bool BLOCK_PAST_DAYS = false;
-    public const int COMPLETED_PAGE_SIZE = 15;
-    public const int HEADERBAR_TITLE_SCROLL_THRESHOLD = 24;
+    /**
+     * When the environment variable `PLANIFY_DEBUG_HTTP` is set to a non-empty value
+     * other than "0", Planify logs full HTTP request/response bodies to stdout **and**
+     * appends the same lines to a log file (see `caldav_http_log_file_path`).
+     * On Windows GUI builds, stdout is often discarded; open the file path instead.
+     * Optional override: `PLANIFY_DEBUG_HTTP_LOG` = absolute path to the log file.
+     */
+    public static bool debug_caldav_http () {
+        string? v = GLib.Environment.get_variable ("PLANIFY_DEBUG_HTTP");
+        return v != null && v != "" && v != "0";
+    }
 
-    /** Override path with `PLANIFY_AGENT_DEBUG_LOG`. Default: cache `io.github.alainm23.planify/debug-020cd6.log` */
+    public static string caldav_http_log_file_path () {
+        string? over = GLib.Environment.get_variable ("PLANIFY_DEBUG_HTTP_LOG");
+        if (over != null && over != "") {
+            return over;
+        }
+        return GLib.Path.build_filename (
+            GLib.Environment.get_user_cache_dir (),
+            "io.github.alainm23.planify",
+            "caldav-http.log"
+        );
+    }
+
+    private class HttpDebugLogSink : GLib.Object {
+        private static GLib.Mutex mtx;
+        private static GLib.DataOutputStream? st;
+
+        static construct {
+            mtx = new GLib.Mutex ();
+        }
+
+        public static void append (string msg) {
+            mtx.lock ();
+            try {
+                if (st == null) {
+                    string path = Constants.caldav_http_log_file_path ();
+                    var parent = GLib.File.new_for_path (path).get_parent ();
+                    if (parent != null && !parent.query_exists ()) {
+                        parent.make_directory_with_parents ();
+                    }
+                    var file = GLib.File.new_for_path (path);
+                    st = new GLib.DataOutputStream (file.append_to (FileCreateFlags.PRIVATE));
+                }
+                st.put_string (msg);
+                st.flush (null);
+            } catch (GLib.Error e) {
+                // ignore
+            } finally {
+                mtx.unlock ();
+            }
+        }
+    }
+
+    /** When `PLANIFY_DEBUG_HTTP` is on: print to stdout and append to the CalDAV HTTP log file. */
+    public static void log_debug_http (string msg) {
+        if (!debug_caldav_http ()) {
+            return;
+        }
+        GLib.stdout.printf ("%s", msg);
+        HttpDebugLogSink.append (msg);
+    }
+
+    /**
+     * NDJSON agent log (debug session). Override path with `PLANIFY_AGENT_DEBUG_LOG` (absolute).
+     * Default: `%Cachedir%/io.github.alainm23.planify/debug-020cd6.log`
+     */
     public static string agent_debug_log_path () {
         string? over = GLib.Environment.get_variable ("PLANIFY_AGENT_DEBUG_LOG");
         if (over != null && over != "") {
@@ -83,4 +118,35 @@ namespace Constants {
         } catch (GLib.Error e) {
         }
     }
+
+    public const string SOUP_USER_AGENT = "Planify";
+    public const string TODOIST_CLIENT_ID = "b0dd7d3714314b1dbbdab9ee03b6b432";
+    public const string TODOIST_CLIENT_SECRET = "a86dfeb12139459da3e5e2a8c197c678";
+    public const string TODOIST_SCOPE = "data:read_write,data:delete,project:delete";
+    public const string TODOIST_REDIRECT_URI = "planify://auth";
+    public const string BACKUP_VERSION = "2.0";
+    public const int UPDATE_TIMEOUT = 1500;
+    public const int DESTROY_TIMEOUT = 750;
+    public const int STARTUP_SYNC_TIMEOUT = 2500;
+    public const int SHORT_NAME_SIZE = 20;
+    public const int PRIORITY_1 = 4;
+    public const int PRIORITY_2 = 3;
+    public const int PRIORITY_3 = 2;
+    public const int PRIORITY_4 = 1;
+    public const int SCROLL_STEPS = 6;
+    public const string TWITTER_URL = "https://twitter.com/useplanify";
+    public const string CONTACT_US = "alainmh23@gmail.com";
+    public const string PATREON_URL = "https://www.patreon.com/join/alainm23";
+    public const string PAYPAL_ME_URL = "https://www.paypal.com/paypalme/alainm23";
+    public const string LIBERAPAY_URL = "https://liberapay.com/Alain/";
+    public const string KOFI_URL = "https://ko-fi.com/alainm23";
+    public const string MASTODON_URL = "https://mastodon.social/@planifyapp";
+    public const string DISCORD_URL = "https://discord.com/invite/dxxyumrTJW";
+    public const string ISSUE_URL = "https://github.com/alainm23/planify/issues";
+    public const string WEBLATE_URL = "https://hosted.weblate.org/engage/planner/";
+    public const string FLATHUB_URL = "https://flathub.org/apps/io.github.alainm23.planify";
+    public const string PRIVACY_POLICY_URL = "https://useplanify.com/privacy-policy/";
+    public const bool BLOCK_PAST_DAYS = false;
+    public const int COMPLETED_PAGE_SIZE = 15;
+    public const int HEADERBAR_TITLE_SCROLL_THRESHOLD = 24;
 }

@@ -39,6 +39,11 @@ public class Objects.Project : Objects.BaseObject {
     public string source_id { get; set; default = SourceType.LOCAL.to_string (); }
     public string calendar_url { get; set; default = ""; }
     public string calendar_source_uid { get; set; default = ""; }
+    public bool can_have_sections {
+        get {
+            return backend_type == SourceType.TODOIST || backend_type == SourceType.CALDAV;
+        }
+    }
 
     bool _show_completed = false;
     public bool show_completed {
@@ -146,12 +151,6 @@ public class Objects.Project : Objects.BaseObject {
         }
     }
 
-    public bool can_have_sections {
-        get {
-            return source_type == SourceType.LOCAL || source_type == SourceType.TODOIST || source_type == SourceType.CALDAV;
-        }
-    }
-
     Gee.ArrayList<Objects.Section> _sections = null;
     public Gee.ArrayList<Objects.Section> sections {
         get {
@@ -161,6 +160,19 @@ public class Objects.Project : Objects.BaseObject {
 
             return _sections;
         }
+    }
+
+    public void refresh_sections () {
+        _sections = Services.Store.instance ().get_sections_by_project (this);
+    }
+
+    /** First section row for this project (inbox / default list target), or null if none. */
+    public Objects.Section ? get_primary_section () {
+        if (sections.size == 0) {
+            return null;
+        }
+
+        return sections.get (0);
     }
 
     Gee.ArrayList<Objects.Section> _sections_archived;
@@ -325,34 +337,34 @@ public class Objects.Project : Objects.BaseObject {
         if (propstat.get_first_prop_with_tagname ("displayname") != null) {
             name = propstat.get_first_prop_with_tagname ("displayname").text_content;
         }
+        if (name.strip () == "") {
+            if (calendar_url != null && calendar_url != "") {
+                string[] segs = calendar_url.split ("/");
+                for (int i = segs.length - 1; i >= 0; i--) {
+                    if (segs[i] != null && segs[i] != "") {
+                        name = segs[i];
+                        break;
+                    }
+                }
+            }
+            if (name.strip () == "") {
+                name = _("Untitled calendar");
+            }
+        }
         if (propstat.get_first_prop_with_tagname ("calendar-color") != null) {
             color = propstat.get_first_prop_with_tagname ("calendar-color").text_content;
-        } else if (propstat.get_first_prop_with_tagname ("apple-calendar-color") != null) {
-            color = propstat.get_first_prop_with_tagname ("apple-calendar-color").text_content;
-        } else if (propstat.get_first_prop_with_tagname ("oc:calendar-color") != null) {
-            color = propstat.get_first_prop_with_tagname ("oc:calendar-color").text_content;
         }
-
         if (propstat.get_first_prop_with_tagname ("X-PLANIFY-EMOJI") != null) {
             emoji = propstat.get_first_prop_with_tagname ("X-PLANIFY-EMOJI").text_content;
-        } else if (propstat.get_first_prop_with_tagname ("calendar-icon") != null) {
-            emoji = propstat.get_first_prop_with_tagname ("calendar-icon").text_content;
-        } else if (propstat.get_first_prop_with_tagname ("apple-calendar-icon") != null) {
-            emoji = propstat.get_first_prop_with_tagname ("apple-calendar-icon").text_content;
-        } else if (propstat.get_first_prop_with_tagname ("calendar-emoji") != null) {
-            emoji = propstat.get_first_prop_with_tagname ("calendar-emoji").text_content;
         }
-
         if (propstat.get_first_prop_with_tagname ("X-PLANIFY-ICON-STYLE") != null) {
             var style_str = propstat.get_first_prop_with_tagname ("X-PLANIFY-ICON-STYLE").text_content;
             icon_style = ProjectIconStyle.parse (style_str);
         }
-
         if (propstat.get_first_prop_with_tagname ("X-PLANIFY-DESCRIPTION") != null) {
             var d = propstat.get_first_prop_with_tagname ("X-PLANIFY-DESCRIPTION").text_content;
             description = d != null ? d : "";
         }
-
         if (update_sync_token) {
             var st = propstat.get_first_prop_with_tagname ("sync-token");
             if (st != null && st.text_content != null) {
@@ -470,10 +482,9 @@ public class Objects.Project : Objects.BaseObject {
         update_timeout_id = Timeout.add (timeout, () => {
             update_timeout_id = 0;
 
-            // Optimistic local update
-            Services.Store.instance ().update_project (this);
-
-            if (backend_type == SourceType.TODOIST) {
+            if (backend_type == SourceType.LOCAL) {
+                Services.Store.instance ().update_project (this);
+            } else if (backend_type == SourceType.TODOIST) {
                 if (show_loading) {
                     loading = true;
                 }
@@ -876,7 +887,7 @@ public class Objects.Project : Objects.BaseObject {
         string uri = "";
         uri += "mailto:?subject=%s&body=%s".printf (name, to_markdown ());
         try {
-            AppInfo.launch_default_for_uri (uri, null);
+            Util.open_url (uri);
         } catch (Error e) {
             warning ("%s\n", e.message);
         }

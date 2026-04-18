@@ -491,8 +491,14 @@ public class Services.Store : GLib.Object {
 
     public void insert_section (Objects.Section section) {
         if (Services.Database.get_default ().insert_section (section)) {
+            debug ("Store.vala: Creating new section: \"%s\" (project_id=%s)", section.name, section.project_id);
             sections.add (section);
-            section.project.section_added (section);
+            var _project = get_project (section.project_id);
+            if (_project != null) {
+                _project.section_added (section);
+            } else {
+                warning ("Store.vala: insert_section — project not found for project_id=%s, section will be in DB but UI won't update until next sync", section.project_id);
+            }
         }
     }
 
@@ -583,20 +589,6 @@ public class Services.Store : GLib.Object {
         return return_value;
     }
 
-    public Objects.Section? get_section_by_name (string project_id, string name) {
-        Objects.Section? return_value = null;
-        lock (_sections) {
-            foreach (var section in sections) {
-                if (section.project_id == project_id && section.name == name) {
-                    return_value = section;
-                    break;
-                }
-            }
-        }
-
-        return return_value;
-    }
-
     public Gee.ArrayList<Objects.Section> get_sections_archived_by_project (Objects.Project project) {
         Gee.ArrayList<Objects.Section> return_value = new Gee.ArrayList<Objects.Section> ();
         lock (_sections) {
@@ -659,6 +651,10 @@ public class Services.Store : GLib.Object {
             foreach (var item in items) {
                 Objects.Item? existing = get_item (item.id);
                 if (existing != null) {
+                    /*
+                     * Full calendar-query uses INSERT OR IGNORE; in-memory registration must not add a second
+                     * `Item` with the same UID (duplicate UI rows: section + inbox, duplicate reminders).
+                     */
                     // #region agent log
                     int64 ts = GLib.get_real_time () / 1000;
                     string eid = item.id.replace ("\\", "\\\\").replace ("\"", "\\\"");
@@ -1526,7 +1522,18 @@ public class Services.Store : GLib.Object {
     public void clear_project_cache (string project_id) {
         _items_by_project_cache.unset (project_id);
     }
+    public Objects.Section? get_section_by_name (string project_id, string name) {
+        foreach (var section in this.sections) {
+            if (section.project_id == project_id && section.name == name) {
+                return section;
+            }
+        }
+        return null;
+    }
 
+    // Atomically find-or-create a section by project + name. This avoids
+    // races where multiple items being imported concurrently create the
+    // same section multiple times.
     /**
      * @param preferred_id Optional CalDAV VTODO UID to use as local section id (RFC 5545 UID) for stable cross-device mapping.
      */
@@ -1538,12 +1545,14 @@ public class Services.Store : GLib.Object {
         }
 
         lock (_sections) {
+            // Search existing sections (case-insensitive compare)
             foreach (var section in sections) {
                 if (section.project_id == project_id && section.name.down ().strip () == normalized_name.down ().strip ()) {
                     return section;
                 }
             }
 
+            // Not found: create and persist
             var new_section = new Objects.Section ();
             if (preferred_id != null && preferred_id.strip () != "" && get_section (preferred_id) == null) {
                 new_section.id = preferred_id.strip ();
@@ -1559,8 +1568,10 @@ public class Services.Store : GLib.Object {
             }
 
             if (Services.Database.get_default ().insert_section (new_section)) {
+                // Add to store collection
                 sections.add (new_section);
 
+                // Also add to project in-memory sections list if project exists
                 Objects.Project ? proj = get_project (project_id);
                 if (proj != null) {
                     proj.add_section (new_section);
@@ -1571,6 +1582,7 @@ public class Services.Store : GLib.Object {
 
                 return new_section;
             } else {
+                // If DB insertion fails, try to find it again (concurrent process may have inserted)
                 foreach (var section in sections) {
                     if (section.project_id == project_id && section.name.down ().strip () == normalized_name.down ().strip ()) {
                         return section;

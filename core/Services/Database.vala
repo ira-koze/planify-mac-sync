@@ -174,6 +174,17 @@ public class Services.Database : GLib.Object {
         table_columns["Sources"].add ("sync_server");
         table_columns["Sources"].add ("last_sync");
         table_columns["Sources"].add ("data");
+
+        table_columns["Credentials"] = new Gee.ArrayList<string> ();
+        table_columns["Credentials"].add ("source_id");
+        table_columns["Credentials"].add ("secret_blob");
+
+        table_columns["SyncErrors"] = new Gee.ArrayList<string> ();
+        table_columns["SyncErrors"].add ("id");
+        table_columns["SyncErrors"].add ("source");
+        table_columns["SyncErrors"].add ("affected_uid");
+        table_columns["SyncErrors"].add ("message");
+        table_columns["SyncErrors"].add ("created_at");
     }
 
     public void init_database () {
@@ -183,6 +194,7 @@ public class Services.Database : GLib.Object {
         create_tables ();
         create_triggers ();
         patch_database ();
+        Services.CredentialStore.migrate_legacy_plaintext_into_credentials ();
         opened ();
         is_opened = true;
     }
@@ -388,6 +400,31 @@ public class Services.Database : GLib.Object {
                 sync_server         INTEGER,
                 last_sync           TEXT,
                 data                TEXT
+            );
+        """;
+
+        if (db.exec (sql, null, out errormsg) != Sqlite.OK) {
+            warning (errormsg);
+        }
+
+        sql = """
+            CREATE TABLE IF NOT EXISTS Credentials (
+                source_id       TEXT PRIMARY KEY,
+                secret_blob     TEXT NOT NULL
+            );
+        """;
+
+        if (db.exec (sql, null, out errormsg) != Sqlite.OK) {
+            warning (errormsg);
+        }
+
+        sql = """
+            CREATE TABLE IF NOT EXISTS SyncErrors (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                source          TEXT,
+                affected_uid    TEXT,
+                message         TEXT,
+                created_at      TEXT DEFAULT (datetime('now','localtime'))
             );
         """;
 
@@ -650,6 +687,11 @@ public class Services.Database : GLib.Object {
         add_text_column ("Items", "calendar_event_uid", "");
         add_text_column ("Items", "deadline_date", "");
         add_text_column ("Items", "responsible_uid", "");
+
+        /*
+         * Planify CalDAV reliability
+         * - needs_push: local row must be PUT to the server (retry on sync)
+         */
         add_int_column ("Items", "needs_push", 0);
     }
 
@@ -683,8 +725,8 @@ public class Services.Database : GLib.Object {
         }
 
         // Verify Tables Integrity
-        string[] tables = { "Attachments", "CurTempIds", "Items", "Labels",
-                            "OEvents", "Projects", "Queue", "Reminders", "Sections", "Sources" };
+        string[] tables = { "Attachments", "Credentials", "CurTempIds", "Items", "Labels",
+                            "OEvents", "Projects", "Queue", "Reminders", "Sections", "Sources", "SyncErrors" };
 
         foreach (var table_name in tables) {
             if (!table_exists (table_name)) {
@@ -768,11 +810,18 @@ public class Services.Database : GLib.Object {
         return_value.sync_server = get_parameter_bool (stmt, 7);
         return_value.last_sync = stmt.column_text (8);
 
-        if (return_value.source_type == SourceType.TODOIST) {
-            return_value.data = new Objects.SourceTodoistData.from_json (stmt.column_text (9));
-        } else if (return_value.source_type == SourceType.CALDAV) {
-            return_value.data = new Objects.SourceCalDAVData.from_json (stmt.column_text (9));
+        string data_col = stmt.column_text (9) ?? "{}";
+        if (data_col == "") {
+            data_col = "{}";
         }
+
+        if (return_value.source_type == SourceType.TODOIST) {
+            return_value.data = new Objects.SourceTodoistData.from_json (data_col);
+        } else if (return_value.source_type == SourceType.CALDAV) {
+            return_value.data = new Objects.SourceCalDAVData.from_json (data_col);
+        }
+
+        Services.CredentialStore.restore_secrets_after_load (return_value);
 
         return return_value;
     }
@@ -797,7 +846,7 @@ public class Services.Database : GLib.Object {
         set_parameter_int (stmt, "$child_order", source.child_order);
         set_parameter_bool (stmt, "$sync_server", source.sync_server);
         set_parameter_str (stmt, "$last_sync", source.last_sync);
-        set_parameter_str (stmt, "$data", source.data.to_json ());
+        set_parameter_str (stmt, "$data", Services.CredentialStore.source_data_payload_for_database (source));
 
         int result = stmt.step ();
         if (result != Sqlite.DONE) {
@@ -823,6 +872,8 @@ public class Services.Database : GLib.Object {
             warning ("Error: %d: %s", db.errcode (), db.errmsg ());
             return false;
         }
+
+        Services.CredentialStore.on_source_removed (source.id);
 
         return true;
     }
@@ -851,7 +902,7 @@ public class Services.Database : GLib.Object {
         set_parameter_int (stmt, "$child_order", source.child_order);
         set_parameter_bool (stmt, "$sync_server", source.sync_server);
         set_parameter_str (stmt, "$last_sync", source.last_sync);
-        set_parameter_str (stmt, "$data", source.data.to_json ());
+        set_parameter_str (stmt, "$data", Services.CredentialStore.source_data_payload_for_database (source));
         set_parameter_str (stmt, "$id", source.id);
 
         int result = stmt.step ();
@@ -861,6 +912,140 @@ public class Services.Database : GLib.Object {
         }
 
         return true;
+    }
+
+#if IS_WINDOWS
+    [CCode (has_target = false)]
+    public delegate void SourceCredentialMigrationVisitor (string source_id, SourceType source_type, string? data_json);
+
+    public void visit_sources_for_credential_migration (SourceCredentialMigrationVisitor visitor) {
+        Sqlite.Statement stmt;
+
+        sql = """
+            SELECT id, source_type, data FROM Sources;
+        """;
+
+        db.prepare_v2 (sql, sql.length, out stmt);
+
+        while (stmt.step () == Sqlite.ROW) {
+            string data = stmt.column_text (2);
+            if (data == null) {
+                data = "{}";
+            }
+
+            visitor (stmt.column_text (0), SourceType.parse (stmt.column_text (1)), data);
+        }
+    }
+
+    public bool upsert_source_secret (string source_id, string secret_blob_b64) {
+        Sqlite.Statement stmt;
+
+        sql = """
+            INSERT OR REPLACE INTO Credentials (source_id, secret_blob)
+            VALUES ($id, $blob);
+        """;
+
+        db.prepare_v2 (sql, sql.length, out stmt);
+        set_parameter_str (stmt, "$id", source_id);
+        set_parameter_str (stmt, "$blob", secret_blob_b64);
+
+        return stmt.step () == Sqlite.DONE;
+    }
+
+    public string? get_source_secret (string source_id) {
+        Sqlite.Statement stmt;
+
+        sql = """
+            SELECT secret_blob FROM Credentials WHERE source_id = $id LIMIT 1;
+        """;
+
+        db.prepare_v2 (sql, sql.length, out stmt);
+        set_parameter_str (stmt, "$id", source_id);
+
+        if (stmt.step () != Sqlite.ROW) {
+            return null;
+        }
+
+        return stmt.column_text (0);
+    }
+
+    public bool source_secret_exists (string source_id) {
+        string? b = get_source_secret (source_id);
+        return b != null && b != "";
+    }
+
+    public bool delete_source_secret (string source_id) {
+        Sqlite.Statement stmt;
+
+        sql = """
+            DELETE FROM Credentials WHERE source_id = $id;
+        """;
+
+        db.prepare_v2 (sql, sql.length, out stmt);
+        set_parameter_str (stmt, "$id", source_id);
+
+        return stmt.step () == Sqlite.DONE;
+    }
+
+    public bool update_source_data_column (string source_id, string data_json) {
+        Sqlite.Statement stmt;
+
+        sql = """
+            UPDATE Sources SET data = $data WHERE id = $id;
+        """;
+
+        db.prepare_v2 (sql, sql.length, out stmt);
+        set_parameter_str (stmt, "$data", data_json);
+        set_parameter_str (stmt, "$id", source_id);
+
+        return stmt.step () == Sqlite.DONE;
+    }
+#endif
+
+    public bool insert_sync_error (string source, string affected_uid, string message) {
+        Sqlite.Statement stmt;
+
+        sql = """
+            INSERT INTO SyncErrors (source, affected_uid, message) VALUES ($source, $uid, $msg);
+        """;
+
+        if (db.prepare_v2 (sql, sql.length, out stmt) != Sqlite.OK) {
+            warning ("insert_sync_error prepare failed: %s", db.errmsg ());
+            return false;
+        }
+
+        set_parameter_str (stmt, "$source", source);
+        set_parameter_str (stmt, "$uid", affected_uid);
+        set_parameter_str (stmt, "$msg", message);
+
+        int result = stmt.step ();
+        if (result != Sqlite.DONE) {
+            warning ("insert_sync_error step failed: %d %s", db.errcode (), db.errmsg ());
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Keep only the N most recent rows in SyncErrors. Prevents unbounded growth over time.
+     */
+    public bool prune_sync_errors (int keep_last) {
+        Sqlite.Statement stmt;
+
+        sql = """
+            DELETE FROM SyncErrors
+            WHERE id NOT IN (
+                SELECT id FROM SyncErrors ORDER BY id DESC LIMIT $keep
+            );
+        """;
+
+        if (db.prepare_v2 (sql, sql.length, out stmt) != Sqlite.OK) {
+            return false;
+        }
+
+        set_parameter_int (stmt, "$keep", keep_last);
+        return stmt.step () == Sqlite.DONE;
     }
 
     /*
@@ -1546,27 +1731,6 @@ public class Services.Database : GLib.Object {
         return returned;
     }
 
-    public Gee.ArrayList<Objects.Item> get_items_needing_push (string project_id) {
-        Gee.ArrayList<Objects.Item> return_value = new Gee.ArrayList<Objects.Item> ();
-        Sqlite.Statement stmt;
-
-        sql = """
-            SELECT * FROM Items
-            WHERE project_id = $project_id
-              AND needs_push = 1
-              AND is_deleted = 0;
-        """;
-
-        db.prepare_v2 (sql, sql.length, out stmt);
-        set_parameter_str (stmt, "$project_id", project_id);
-
-        while (stmt.step () == Sqlite.ROW) {
-            return_value.add (_fill_item (stmt));
-        }
-
-        return return_value;
-    }
-
     public Objects.Item _fill_item (Sqlite.Statement stmt) {
         Objects.Item return_value = new Objects.Item ();
         return_value.id = stmt.column_text (0);
@@ -1588,13 +1752,34 @@ public class Services.Database : GLib.Object {
         return_value.pinned = get_parameter_bool (stmt, 16);
         return_value.labels = Services.Store.instance ().get_labels_by_item_labels (stmt.column_text (17));
         return_value.extra_data = stmt.column_text (18);
-        return_value.item_type = ItemType.parse (stmt.column_text (19));
+        string? raw_item_type = stmt.column_text (19);
+        return_value.item_type = (raw_item_type != null && raw_item_type != "")
+            ? ItemType.parse (raw_item_type)
+            : ItemType.TASK;
         return_value.calendar_event_uid = stmt.column_text (20);
         return_value.deadline_date = stmt.column_text (21);
         return_value.responsible_uid = stmt.column_text (22);
         return_value.needs_push = get_parameter_bool (stmt, 23);
 
         return return_value;
+    }
+
+    public Gee.ArrayList<Objects.Item> get_items_needing_push (string project_id) {
+        var list = new Gee.ArrayList<Objects.Item> ();
+        Sqlite.Statement stmt;
+
+        sql = """
+            SELECT * FROM Items WHERE project_id = $pid AND needs_push = 1 AND is_deleted = 0;
+        """;
+
+        db.prepare_v2 (sql, sql.length, out stmt);
+        set_parameter_str (stmt, "$pid", project_id);
+
+        while (stmt.step () == Sqlite.ROW) {
+            list.add (_fill_item (stmt));
+        }
+
+        return list;
     }
 
     public bool delete_item (Objects.Item item) {

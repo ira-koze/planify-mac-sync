@@ -27,7 +27,18 @@ public class Services.CalDAV.WebDAVClient : GLib.Object {
     protected string password;
     protected string base_url;
     protected bool ignore_ssl;
+
+    private string _last_request_signature = "";
+
+    /** Clears duplicate-request detection (e.g. before a deliberate second PUT after 415). */
+    protected void clear_last_request_signature () {
+        _last_request_signature = "";
+    }
+
+    /** ETag from the last completed HTTP response (PUT/GET/etc.), for CalDAV If-Match. */
     protected string _last_response_etag = "";
+
+    /** HTTP status code from the last completed HTTP response. */
     protected uint _last_http_status_code = 0;
 
 
@@ -81,6 +92,12 @@ public class Services.CalDAV.WebDAVClient : GLib.Object {
         if (abs_url == null)
             throw new GLib.IOError.FAILED ("Invalid URL: %s".printf (url));
 
+        var sig = "%s %s".printf (method, abs_url);
+        if (sig == _last_request_signature) {
+            debug ("Duplicate consecutive HTTP request: %s", sig);
+        }
+
+        _last_request_signature = sig;
         _last_response_etag = "";
         _last_http_status_code = 0;
 
@@ -147,6 +164,27 @@ public class Services.CalDAV.WebDAVClient : GLib.Object {
                 msg.request_headers.replace ("Content-Type", effective_ct);
             }
         } catch (Error e) {
+            // ignore header set errors
+        }
+
+        if (Constants.debug_caldav_http ()) {
+            try {
+                Constants.log_debug_http ("[Agent Marker 020cd6] WebDAVClient.send_request active\n");
+                Constants.log_debug_http ("HTTP-REQ %s %s\n".printf (method, abs_url));
+                if (depth != null)
+                    Constants.log_debug_http ("Request Header: Depth: %s\n".printf (depth));
+                if (extra_headers != null) {
+                    foreach (var key in extra_headers.get_keys ())
+                        Constants.log_debug_http ("Request Header: %s: %s\n".printf (key, extra_headers.lookup (key)));
+                }
+                Constants.log_debug_http ("Request Header: User-Agent: %s\n".printf (Constants.SOUP_USER_AGENT));
+                if (effective_ct != null)
+                    Constants.log_debug_http ("Request Header: Content-Type: %s\n".printf (msg.request_headers.get_one ("Content-Type")));
+                if (body != null)
+                    Constants.log_debug_http ("Request body:\n%s\n".printf (body));
+            } catch (Error e) {
+                // ignore debug logging errors
+            }
         }
 
         GLib.Bytes response;
@@ -158,11 +196,26 @@ public class Services.CalDAV.WebDAVClient : GLib.Object {
             }
             throw new GLib.IOError.FAILED ("Request failed: %s".printf (e.message));
         }
-
         _last_http_status_code = msg.status_code;
         string? etag_hdr = msg.response_headers.get_one ("ETag");
         if (etag_hdr != null) {
             _last_response_etag = etag_hdr;
+        }
+
+        if (Constants.debug_caldav_http ()) {
+            try {
+                var resp_txt = (string) response.get_data ();
+                Constants.log_debug_http ("HTTP %s %s -> %u %s\n".printf (method, abs_url, msg.status_code, msg.reason_phrase ?? ""));
+                Constants.log_debug_http ("Response Headers:\n");
+                Constants.log_debug_http ("  Content-Type: %s\n".printf (msg.response_headers.get_one ("Content-Type") ?? ""));
+                Constants.log_debug_http ("  ETag: %s\n".printf (msg.response_headers.get_one ("ETag") ?? ""));
+                Constants.log_debug_http ("  Content-Length: %s\n".printf (msg.response_headers.get_one ("Content-Length") ?? ""));
+                Constants.log_debug_http ("  Last-Modified: %s\n".printf (msg.response_headers.get_one ("Last-Modified") ?? ""));
+                Constants.log_debug_http ("  Server: %s\n".printf (msg.response_headers.get_one ("Server") ?? ""));
+                Constants.log_debug_http ("Response body:\n%s\n".printf (resp_txt));
+            } catch (Error e) {
+                // ignore debug logging errors
+            }
         }
 
         bool ok = false;
@@ -181,14 +234,24 @@ public class Services.CalDAV.WebDAVClient : GLib.Object {
             );
         }
 
+        // Return response text without injecting a NUL byte — keep logs plain-text.
         var response_text = (string) response.get_data ();
 
+        /* RFC 4918 (WebDAV) / RFC 4791 (CalDAV): log PUT/PROPPATCH bodies for 207 per-prop diagnostics. */
         if (method == "PUT" || method == "PROPPATCH") {
-            stderr.printf ("[CalDAV] %s %s -> HTTP %u %s\n", method, abs_url, msg.status_code, msg.reason_phrase ?? "");
-            if (body != null) {
-                stderr.printf ("[CalDAV] Request body:\n%s\n", body);
+            if (Constants.debug_caldav_http ()) {
+                Constants.log_debug_http ("[CalDAV] %s %s -> HTTP %u %s\n".printf (method, abs_url, msg.status_code, msg.reason_phrase ?? ""));
+                if (body != null) {
+                    Constants.log_debug_http ("[CalDAV] Request body:\n%s\n".printf (body));
+                }
+                Constants.log_debug_http ("[CalDAV] Response body:\n%s\n".printf (response_text));
+            } else {
+                stderr.printf ("[CalDAV] %s %s -> HTTP %u %s\n", method, abs_url, msg.status_code, msg.reason_phrase ?? "");
+                if (body != null) {
+                    stderr.printf ("[CalDAV] Request body:\n%s\n", body);
+                }
+                stderr.printf ("[CalDAV] Response body:\n%s\n", response_text);
             }
-            stderr.printf ("[CalDAV] Response body:\n%s\n", response_text);
         }
 
         return response_text;
@@ -199,6 +262,7 @@ public class Services.CalDAV.WebDAVClient : GLib.Object {
      * RFC 4918 (WebDAV XML), RFC 4791 (CalDAV).
      */
     protected string sanitize_xml_response (string response_text) {
+        /* NUL / stray bytes after XML confuse GXml — strip before locating the root element. RFC 4918 */
         string cleaned = response_text.replace ("\0", "");
 
         int xml_start = cleaned.index_of ("<?xml");
@@ -225,6 +289,10 @@ public class Services.CalDAV.WebDAVClient : GLib.Object {
         return cleaned.strip ();
     }
 
+    /**
+     * Last `</…multistatus>` in document (root close); opening `<d:multistatus` uses `<` not `</`.
+     * Returns index of closing `>` for that tag. RFC 4918 (WebDAV XML).
+     */
     private int find_last_closing_multistatus_gt (string s, int start) {
         int found = -1;
         int pos = start;
@@ -259,9 +327,12 @@ public class Services.CalDAV.WebDAVMultiStatus : Object {
     }
 
     public void debug_print () {
-        print ("-------------------------------\n");
-        debug ("%s\b", xml_content);
-        print ("-------------------------------\n");
+        if (!Constants.debug_caldav_http ()) {
+            return;
+        }
+        Constants.log_debug_http ("-------------------------------\n");
+        Constants.log_debug_http ("%s\n".printf (xml_content));
+        Constants.log_debug_http ("-------------------------------\n");
     }
 
     public Gee.ArrayList<WebDAVResponse> responses () {
@@ -373,11 +444,61 @@ public class Services.CalDAV.WebDAVPropStat : Object {
             return null;
         }
 
-        foreach (var e in prop.get_elements_by_tag_name (tagname)) {
-            return e;
+        return find_element_by_local_name (prop, tagname.down ());
+    }
+
+    // Recursively search an element subtree by local name only, ignoring namespace prefixes.
+    private GXml.DomElement? find_element_by_local_name (GXml.DomElement el, string tagname) {
+        string normalized_name = get_searchable_local_name (el);
+        if (matches_tagname (normalized_name, tagname)) {
+            return el;
+        }
+
+        for (int i = 0; i < el.child_nodes.length; i++) {
+            var node = el.child_nodes.item (i);
+            if (node is GXml.DomElement) {
+                var found = find_element_by_local_name ((GXml.DomElement) node, tagname);
+                if (found != null) {
+                    return found;
+                }
+            }
         }
 
         return null;
     }
 
+    private bool matches_tagname (string normalized_name, string tagname) {
+        // Objective 3: Namespace Blindness Hard Fix
+        // Match purely on local name, ignoring URI mismatches in server namespaces.
+        string target = tagname.down ();
+
+        if (normalized_name == target) {
+            return true;
+        }
+
+        // Special handling for X-PLANIFY properties which may be trapped in misspelled namespaces
+        if (target.has_prefix ("x-planify-")) {
+            return normalized_name.contains (target);
+        }
+
+        return normalized_name == target;
+    }
+
+    private string get_searchable_local_name (GXml.DomElement el) {
+        string? local_name = el.local_name;
+        if (local_name != null && local_name != "") {
+            return local_name.down ();
+        }
+
+        return get_local_name (el.tag_name).down ();
+    }
+
+    private string get_local_name (string qualified_name) {
+        int separator_index = qualified_name.last_index_of (":");
+        if (separator_index >= 0 && separator_index + 1 < qualified_name.length) {
+            return qualified_name.substring (separator_index + 1);
+        }
+
+        return qualified_name;
+    }
 }

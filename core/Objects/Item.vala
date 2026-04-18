@@ -20,6 +20,31 @@
  */
 
 public class Objects.Item : Objects.BaseObject {
+    private static string debug_json_escape (string? s) {
+        if (s == null) {
+            return "";
+        }
+
+        return s.replace ("\\", "\\\\").replace ("\"", "\\\"").replace ("\r", "\\r").replace ("\n", "\\n");
+    }
+
+    private static void debug_agent_log (string run_id, string hypothesis_id, string location, string message, string data_json = "{}") {
+        try {
+            int64 ts = GLib.get_real_time () / 1000;
+            string line = "{\"sessionId\":\"020cd6\",\"runId\":\"%s\",\"hypothesisId\":\"%s\",\"location\":\"%s\",\"message\":\"%s\",\"data\":%s,\"timestamp\":%lld}\n".printf (
+                debug_json_escape (run_id),
+                debug_json_escape (hypothesis_id),
+                debug_json_escape (location),
+                debug_json_escape (message),
+                data_json,
+                ts
+            );
+            Constants.agent_debug_log_append_line (line);
+        } catch (Error e) {
+            // no-op: debug instrumentation must never break sync
+        }
+    }
+
     public string content { get; set; default = ""; }
     public string description { get; set; default = ""; }
     public string added_at { get; set; default = new GLib.DateTime.now_local ().to_string (); }
@@ -55,9 +80,10 @@ public class Objects.Item : Objects.BaseObject {
         }
     }
     public string extra_data { get; set; default = ""; }
+    /** When true, local changes must still be uploaded via CalDAV PUT (retry on sync). */
+    public bool needs_push { get; set; default = false; }
     public ItemType item_type { get; set; default = ItemType.TASK; }
     public string responsible_uid { get; set; default = ""; }
-    public bool needs_push { get; set; default = false; }
 
 
     public Objects.DueDate due { get; set; default = new Objects.DueDate (); }
@@ -211,8 +237,12 @@ public class Objects.Item : Objects.BaseObject {
             var json_object = Services.Todoist.get_default ().get_object_by_string (extra_data);
 
             if (json_object.has_member ("ics")) {
-                _ical_url = "%s/%s".printf (project.calendar_url, json_object.get_string_member ("ics")); // TODO: Should the stored data be migrated?
-            }else {
+                if (project != null) {
+                    _ical_url = "%s/%s".printf (project.calendar_url, json_object.get_string_member ("ics"));
+                } else {
+                    _ical_url = json_object.get_string_member ("ics");
+                }
+            } else {
                 _ical_url = Services.Todoist.get_default ().get_string_member_by_object (extra_data, "ical_url");
             }
             return _ical_url;
@@ -476,6 +506,15 @@ public class Objects.Item : Objects.BaseObject {
     }
 
     public void patch_from_vtodo (string data, string _ical_url, bool is_update = false, string? remote_etag = null) {
+        // Objective 2: Regex Unfolding Hard Fix
+        // Handles CRLF/LF and any amount of leading linear whitespace on continuation lines.
+        try {
+            var regex = new Regex ("(?:\\r\\n|\\n)[ \\t]+");
+            data = regex.replace (data, -1, 0, "");
+        } catch (Error e) {
+            warning ("Failed to unfold VTODO buffer: %s", e.message);
+        }
+
         ICal.Component ical = ICal.Parser.parse_string (data);
         ICal.Component ? ical_vtodo = ical.get_first_component (ICal.ComponentKind.VTODO_COMPONENT);
         if (ical_vtodo == null) {
@@ -483,12 +522,15 @@ public class Objects.Item : Objects.BaseObject {
             return;
         }
 
-        id = ical_vtodo.get_uid ();
+        string u = ical_vtodo.get_uid ();
+        id = (u != null && u.strip () != "") ? u : ical.get_uid ();
+
         content = ical_vtodo.get_summary ();
         if (content == null || content == "") {
             content = _("Untitled Task");
         }
 
+        /* DESCRIPTION merge: only the VTODO property controls updates — missing property must not wipe local note. RFC 5545 §3.8.1.4 */
         string? desc_vtodo = ical_vtodo.get_description ();
         if (desc_vtodo != null && desc_vtodo != "") {
             description = desc_vtodo;
@@ -503,6 +545,10 @@ public class Objects.Item : Objects.BaseObject {
             } else {
                 description = "";
             }
+        }
+
+        if (Constants.debug_caldav_http ()) {
+            Constants.log_debug_http ("[Item Sync Audit] id: %s, summary: '%s', description_length: %d\n".printf (id, content, description.length));
         }
 
         ICal.Property ? priority_property = ical_vtodo.get_first_property (ICal.PropertyKind.PRIORITY_PROPERTY);
@@ -558,47 +604,58 @@ public class Objects.Item : Objects.BaseObject {
             completed_at = "";
         }
 
-        string? x_sort_order = null;
-        string? x_pinned = null;
-        string? x_section_name = null;
-        string? x_section_color = null;
-        string? x_section_id = null;
-        string? x_planify_type = null;
-        string? x_item_type = null;
-        string? x_deadline = null;
+        // Parse all X-properties by iterating and checking names.
+        // IMPORTANT: ICal.PropertyKind.from_string("X-SOMETHING") always returns X_PROPERTY,
+        // so get_first_property(X_PROPERTY) just returns the FIRST X-property, not the named one.
+        // We must iterate and check get_x_name() explicitly.
+        string ? _x_section_name = null;
+        string ? _x_section_color = null;
+        string ? _x_section_id = null;
+        string ? _x_planify_type = null;
+        string ? _x_deadline = null;
+        string ? _x_item_type = null;
+        string ? _x_sort_order = null;
+        string ? _x_pinned = null;
+        string ? raw_categories = null;
+        string ? raw_deadline = null;
+        string ? raw_attach = null;
         var planify_attach_payloads = new Gee.ArrayList<string> ();
 
         ICal.Property ? xprop = ical_vtodo.get_first_property (ICal.PropertyKind.X_PROPERTY);
         while (xprop != null) {
             string? xname = xprop.get_x_name ();
-            string? xval = xprop.get_value_as_string ();
+            string? xval  = xprop.get_value_as_string ();
             if (xname != null && xval != null) {
                 switch (xname) {
                     case "X-APPLE-SORT-ORDER":
-                        x_sort_order = xval;
+                        _x_sort_order = xval;
                         break;
                     case "X-PINNED":
-                        x_pinned = xval;
+                        _x_pinned = xval;
                         break;
                     case "X-PLANIFY-SECTION-NAME":
-                        x_section_name = xval;
+                        _x_section_name = xval;
                         break;
                     case "X-PLANIFY-SECTION-COLOR":
-                        x_section_color = xval;
+                        _x_section_color = xval;
                         break;
                     case "X-PLANIFY-SECTION-ID":
-                        x_section_id = xval;
+                        _x_section_id = xval;
                         break;
                     case "X-PLANIFY-TYPE":
-                        x_planify_type = xval;
-                        break;
-                    case "X-PLANIFY-ITEM-TYPE":
-                        x_item_type = xval;
+                        _x_planify_type = xval;
                         break;
                     case "X-PLANIFY-DEADLINE":
-                        x_deadline = xval;
+                        _x_deadline = xval;
+                        raw_deadline = xval;
+                        break;
+                    case "X-PLANIFY-ITEM-TYPE":
+                        _x_item_type = xval;
                         break;
                     case "X-PLANIFY-ATTACH":
+                        if (raw_attach == null) {
+                            raw_attach = xval;
+                        }
                         planify_attach_payloads.add (xval);
                         break;
                 }
@@ -606,111 +663,156 @@ public class Objects.Item : Objects.BaseObject {
             xprop = ical_vtodo.get_next_property (ICal.PropertyKind.X_PROPERTY);
         }
 
-        if (x_sort_order != null && x_sort_order != "") {
-            child_order = int.parse (x_sort_order);
+        bool has_section_metadata = (_x_section_name != null && _x_section_name != "") ||
+                                    (_x_section_id != null && _x_section_id != "") ||
+                                    (_x_section_color != null && _x_section_color != "") ||
+                                    (_x_planify_type != null && _x_planify_type.up ().contains ("SECTION")) ||
+                                    (_x_item_type != null && _x_item_type.up ().contains ("SECTION")) ||
+                                    data.contains ("X-PLANIFY-SECTION");
+        if (has_section_metadata && Constants.debug_caldav_http ()) {
+            Constants.log_debug_http (
+                "[Section Audit] Task %s | SectionId: %s | SectionName: %s | SectionColor: %s | PlanifyType: %s | ItemType: %s\n%s\n".printf (
+                this.id,
+                _x_section_id ?? "",
+                _x_section_name ?? "",
+                _x_section_color ?? "",
+                _x_planify_type ?? "",
+                _x_item_type ?? "",
+                data
+            ));
+        }
+
+        // Apply sort order
+        if (_x_sort_order != null) {
+            child_order = int.parse (_x_sort_order);
         } else {
-            // Items without an X-APPLE-SORT-ORDER must use the time in seconds
-            // since 2001-01-01-00:00:00 (978307200L) as their sort order
-           ICal.Property ? created_property = ical_vtodo.get_first_property (ICal.PropertyKind.CREATED_PROPERTY);
+            ICal.Property ? created_property = ical_vtodo.get_first_property (ICal.PropertyKind.CREATED_PROPERTY);
             if (created_property != null) {
                 var create_time = (long) created_property.get_created ().as_timet ();
                 child_order = (int)(create_time - 978307200L);
-            } else {
-                // TODO should probably emit a warning that manual sorting will not work?
             }
         }
 
-        if (x_pinned != null && x_pinned != "") {
-            pinned = bool.parse (x_pinned);
+        // Apply pinned
+        if (_x_pinned != null) {
+            pinned = bool.parse (_x_pinned);
         } else {
             pinned = false;
         }
+        notify_property ("pinned");
 
-        // Prefer explicit section id when available.
-        if (x_section_id != null && x_section_id != "") {
-            var sec_by_id = Services.Store.instance ().get_section (x_section_id);
-            if (sec_by_id != null) {
-                section_id = sec_by_id.id;
+        // Apply section (use atomic store helper to avoid duplicate creation)
+        if (_x_section_name != null && _x_section_name != "") {
+            var store = Services.Store.instance ();
+            var found_section = store.get_section_by_name (project_id, _x_section_name);
+            if (found_section != null) {
+                section_id = found_section.id;
             }
         }
 
-        if ((section_id == null || section_id == "") && x_section_name != null && x_section_name != "") {
-            var store = Services.Store.instance ();
-            var found_section = store.get_section_by_name (project_id, x_section_name);
-            if (found_section == null) {
-                found_section = new Objects.Section ();
-                found_section.id = Util.get_default ().generate_id (found_section);
-                found_section.name = x_section_name;
-                found_section.project_id = project_id;
-                found_section.color = (x_section_color != null && x_section_color != "") ? x_section_color : Util.get_default ().get_random_color ();
-                if (project != null) {
-                    project.add_section_if_not_exists (found_section);
-                } else {
-                    store.insert_section (found_section);
+        if ((section_id == null || section_id == "" || section_id == "0") &&
+            _x_section_id != null && _x_section_id != "") {
+            var existing_section = Services.Store.instance ().get_section (_x_section_id);
+            if (existing_section != null) {
+                section_id = existing_section.id;
+            }
+        }
+
+        // Objective 2: Ghost Task Fallback - Ensure task has a valid section ID before storage
+        if (section_id != null && section_id != "" && section_id != "0" &&
+            Services.Store.instance ().get_section (section_id) == null &&
+            _x_section_name != null && _x_section_name != "") {
+            var placeholder_section = Services.Store.instance ().get_section_by_name (project_id, _x_section_name);
+            if (placeholder_section != null) {
+                section_id = placeholder_section.id;
+            }
+        }
+
+        if (section_id == null || section_id == "" || section_id == "0" ||
+            (section_id != "" && Services.Store.instance ().get_section (section_id) == null)) {
+            if (project != null && project.sections.size > 0) {
+                var sec0 = project.sections.get (0);
+                section_id = sec0 != null ? sec0.id : "";
+            } else {
+                section_id = "";
+            }
+        }
+
+        if (project != null) {
+            Objects.Section? resolved_section = null;
+            if (section_id != null && section_id != "") {
+                resolved_section = project.get_section (section_id);
+                if (resolved_section == null) {
+                    resolved_section = Services.Store.instance ().get_section (section_id);
                 }
             }
-            section_id = found_section.id;
-        }
 
-        if (x_item_type != null && x_item_type != "") {
-            if (x_item_type == "note") {
-                item_type = ItemType.NOTE;
-            } else if (x_item_type.down ().strip () == "section" || (x_planify_type != null && x_planify_type.down ().strip () == "section")) {
-                /* Real section VTODOs should be merged via CalDAV ensure_section_from_vtodo; if parsed as Item, keep TASK to avoid NOTE mis-map. */
-                item_type = ItemType.TASK;
-            } else {
-                item_type = ItemType.TASK;
+            if (resolved_section == null && project.sections.size > 0) {
+                resolved_section = project.sections.first ();
+                section_id = resolved_section.id;
             }
-        } else if (x_planify_type != null && x_planify_type.down ().strip () == "section") {
-            item_type = ItemType.TASK;
-        } else {
-            item_type = ItemType.TASK;
+
+            if (resolved_section != null) {
+                set_section (resolved_section);
+            }
         }
 
-        if (x_deadline != null && x_deadline != "") {
-            deadline_date = x_deadline;
+        // Apply deadline
+        if (_x_deadline != null && _x_deadline != "") {
+            deadline_date = _x_deadline;
         } else {
             deadline_date = "";
         }
 
-        // Parse Attachments (Planify custom + standard ATTACH)
-        if (is_update) {
-            attachments.clear ();
+        // Apply item type
+        if (_x_item_type != null && _x_item_type != "") {
+            item_type = ItemType.parse (_x_item_type);
+        } else {
+            item_type = ItemType.TASK;
         }
-        foreach (string payload in planify_attach_payloads) {
-            if (payload != null && payload != "") {
-                string[] parts = payload.split ("|");
-                if (parts.length == 4) {
-                    var new_attach = new Objects.Attachment ();
-                    new_attach.id = parts[0];
-                    new_attach.item_id = id;
-                    new_attach.file_name = parts[1];
-                    new_attach.file_type = parts[2];
-                    new_attach.file_path = parts[3];
-                    if (is_update) {
-                        attachments.add (new_attach);
-                    }
-                    Services.Store.instance ().insert_attachment (new_attach);
-                }
+
+        // Parse attachments
+        if (is_update) {
+            // On update, clear existing attachments and re-parse from vtodo
+            foreach (var existing_attachment in attachments) {
+                Services.Store.instance ().delete_attachment (existing_attachment);
+            }
+        }
+        foreach (string attach_str in planify_attach_payloads) {
+            parse_planify_attachment_payload (attach_str);
+        }
+
+        var seen_attach_uris = new Gee.HashSet<string> ();
+        foreach (string pstr in planify_attach_payloads) {
+            string[] segs = pstr.split ("|");
+            if (segs.length == 4 && segs[3] != null && segs[3] != "") {
+                seen_attach_uris.add (segs[3]);
             }
         }
 
-        ICal.Property ? std_attach_prop = ical_vtodo.get_first_property (ICal.PropertyKind.ATTACH_PROPERTY);
-        while (std_attach_prop != null) {
-            var attach_url = std_attach_prop.get_value_as_string ();
-            if (attach_url != null && attach_url != "") {
-                var new_attach = new Objects.Attachment ();
-                new_attach.id = Util.get_default ().generate_id (null);
-                new_attach.item_id = id;
-                new_attach.file_path = attach_url;
-                new_attach.file_name = GLib.Path.get_basename (attach_url);
-                
-                if (is_update) {
-                    attachments.add (new_attach);
+        ICal.Property ? standard_attach_prop = ical_vtodo.get_first_property (ICal.PropertyKind.ATTACH_PROPERTY);
+        while (standard_attach_prop != null) {
+            var attach_uri = standard_attach_prop.get_value_as_string ();
+            if (attach_uri != null && attach_uri != "" && !seen_attach_uris.contains (attach_uri)) {
+                raw_attach = attach_uri;
+                if (Constants.debug_caldav_http ()) {
+                    Constants.log_debug_http ("[Attachment Audit] Task %s attached URI: %s\n".printf (this.id, attach_uri));
                 }
-                Services.Store.instance ().insert_attachment (new_attach);
+
+                if (attach_uri.has_prefix ("http://") || attach_uri.has_prefix ("https://")) {
+                    var att = new Objects.Attachment ();
+                    att.id = Util.get_default ().generate_id ();
+                    att.item_id = this.id;
+                    att.file_path = attach_uri;
+                    att.file_type = "application/octet-stream";
+                    att.file_name = attachment_display_name_from_uri (attach_uri);
+                    att.file_size = 0;
+                    add_attachment_if_not_exists (att);
+                    seen_attach_uris.add (attach_uri);
+                }
             }
-            std_attach_prop = ical_vtodo.get_next_property (ICal.PropertyKind.ATTACH_PROPERTY);
+
+            standard_attach_prop = ical_vtodo.get_next_property (ICal.PropertyKind.ATTACH_PROPERTY);
         }
 
         string etag_keep = remote_etag != null && remote_etag != ""
@@ -718,99 +820,87 @@ public class Objects.Item : Objects.BaseObject {
             : Util.get_etag_from_extra_data (extra_data);
         extra_data = Util.generate_extra_data (_ical_url, etag_keep, ical.as_ical_string ());
 
-        // Native Labels Sync (No Evolution dependency)
-        var categories_property = ical_vtodo.get_first_property (ICal.PropertyKind.CATEGORIES_PROPERTY);
+        ICal.Property ? categories_property = ical_vtodo.get_first_property (ICal.PropertyKind.CATEGORIES_PROPERTY);
         if (categories_property != null) {
             var categories_str = categories_property.get_categories ();
+            raw_categories = categories_str;
             if (categories_str != null && categories_str != "") {
-                var categories_list = new GLib.SList<string> ();
-                foreach (var category in categories_str.split (",")) {
-                    categories_list.append (category.strip ());
-                }
-                
                 if (is_update) {
-                    check_labels (get_labels_maps_from_caldav (categories_list));
+                    check_labels (get_labels_maps_from_categories (categories_str));
                 } else {
-                    labels = get_caldav_categories (categories_list);
+                    labels = get_labels_from_categories (categories_str);
                 }
             }
         } else if (is_update) {
             check_labels (new Gee.HashMap<string, Objects.Label> ());
         }
 
-        // Parse Reminders (VALARM)
+        if (Constants.debug_caldav_http ()) {
+            Constants.log_debug_http (
+                "[Metadata Audit] Task %s | Categories: %s | Deadline: %s | Attach: %s\n".printf (
+                this.id,
+                raw_categories ?? "",
+                raw_deadline ?? "",
+                raw_attach ?? ""
+            ));
+        }
+
+        bool has_field_metadata = ((_x_section_id != null && _x_section_id != "") ||
+                                   (_x_section_name != null && _x_section_name != "") ||
+                                   (raw_categories != null && raw_categories != "") ||
+                                   (_x_deadline != null && _x_deadline != "") ||
+                                   (planify_attach_payloads.size > 0) ||
+                                   (raw_attach != null && raw_attach != "") ||
+                                   (ical_vtodo.get_first_component (ICal.ComponentKind.VALARM_COMPONENT) != null));
+        if (has_field_metadata) {
+            // #region agent log
+            debug_agent_log (
+                "initial",
+                "H2",
+                "Item.patch_from_vtodo",
+                "Parsed task metadata from VTODO",
+                """{"itemId":"%s","projectId":"%s","xSectionId":"%s","xSectionName":"%s","resolvedSectionId":"%s","categoriesRaw":"%s","labelsCount":%d,"deadlineRaw":"%s","planifyAttachCount":%d,"hasStandardAttach":%s}""".printf (
+                    debug_json_escape (this.id),
+                    debug_json_escape (project_id),
+                    debug_json_escape (_x_section_id ?? ""),
+                    debug_json_escape (_x_section_name ?? ""),
+                    debug_json_escape (section_id),
+                    debug_json_escape (raw_categories ?? ""),
+                    labels.size,
+                    debug_json_escape (_x_deadline ?? ""),
+                    planify_attach_payloads.size,
+                    (raw_attach != null && raw_attach != "") ? "true" : "false"
+                )
+            );
+            // #endregion
+        }
+
         if (is_update) {
             var old_rem = Services.Store.instance ().get_reminders_by_item (this);
             foreach (var er in old_rem) {
                 Services.Store.instance ().delete_reminder (er);
             }
         }
-        ICal.Component ? alarm = ical_vtodo.get_first_component (ICal.ComponentKind.VALARM_COMPONENT);
-        while (alarm != null) {
-            ICal.Property ? trigger_prop = alarm.get_first_property (ICal.PropertyKind.TRIGGER_PROPERTY);
-            if (trigger_prop != null) {
-                var new_reminder = new Objects.Reminder ();
-                new_reminder.id = Util.get_default ().generate_id (null);
-                new_reminder.item_id = id;
-
-                var trigger_str = normalize_valarm_trigger_value (trigger_prop.get_value_as_string ());
-                if (trigger_str != null && (trigger_str.has_prefix ("P") || trigger_str.has_prefix ("-P"))) {
-                    new_reminder.reminder_type = ReminderType.RELATIVE;
-                    if (trigger_str.contains ("M")) {
-                        var minutes_part = trigger_str.replace ("-PT", "").replace ("PT", "").replace ("M", "");
-                        new_reminder.mm_offset = int.parse (minutes_part);
-                    }
-                } else {
-                    new_reminder.reminder_type = ReminderType.ABSOLUTE;
-                    if (trigger_str != null && trigger_str != "") {
-                        var trigger_time = ICal.Time.from_string (trigger_str);
-                        if (!trigger_time.is_null_time ()) {
-                            new_reminder.due.datetime = Utils.Datetime.ical_to_date_time_local (trigger_time);
-                        }
-                    }
-                }
-                
-                Services.Store.instance ().insert_reminder (new_reminder);
-            }
-            alarm = ical_vtodo.get_next_component (ICal.ComponentKind.VALARM_COMPONENT);
-        }
-        // TODO: Reimplement without ECAL
-    }
-
-    private string? normalize_valarm_trigger_value (string? raw) {
-        if (raw == null || raw == "") {
-            return raw;
-        }
-        string t = raw.strip ();
-        try {
-            var re = new Regex ("-?PT\\d+[HMS]", RegexCompileFlags.CASELESS);
-            MatchInfo mi;
-            if (re.match (t, 0, out mi)) {
-                return mi.fetch (0);
-            }
-        } catch (Error e) {
-        }
-        long last_colon = t.last_index_of (":");
-        if (last_colon >= 0 && last_colon < (long) t.length - 1) {
-            string tail = t.substring ((ssize_t) (last_colon + 1)).strip ();
-            if (tail != "") {
-                return tail;
-            }
-        }
-        return t;
+        parse_reminders_from_vtodo (ical_vtodo);
     }
 
     private Gee.ArrayList<Objects.Label> get_caldav_categories (GLib.SList<string> categories_list) {
         Gee.ArrayList<Objects.Label> return_value = new Gee.ArrayList<Objects.Label> ();
 
         foreach (string category in categories_list) {
-            Objects.Label label = Services.Store.instance ().get_label_by_name (category, true, project.source_id);
+            string? source_id = (project != null) ? project.source_id : null;
+            if (source_id == null) {
+                // Orphaned task, skip label mapping that requires a donor source
+                continue;
+            }
+
+            Objects.Label label = Services.Store.instance ().get_label_by_name (category, true, source_id);
             if (label == null) {
                 label = new Objects.Label ();
                 label.id = Util.get_default ().generate_id (label);
                 label.name = category;
                 label.color = Util.get_default ().get_random_color ();
-                label.source_id = project.source_id;
+                label.source_id = source_id;
                 Services.Store.instance ().insert_label (label);
             }
 
@@ -836,6 +926,8 @@ public class Objects.Item : Objects.BaseObject {
 
     public Gee.ArrayList<Objects.Label> get_labels_from_json (Json.Node node) {
         Gee.ArrayList<Objects.Label> return_value = new Gee.ArrayList<Objects.Label> ();
+        if (project == null) return return_value;
+
         foreach (unowned Json.Node element in node.get_object ().get_array_member ("labels").get_elements ()) {
             Objects.Label label = Services.Store.instance ().get_label_by_name (element.get_string (), true, project.source_id);
             return_value.add (label);
@@ -864,6 +956,8 @@ public class Objects.Item : Objects.BaseObject {
 
     public Gee.HashMap<string, Objects.Label> get_labels_maps_from_json (Json.Node node) {
         Gee.HashMap<string, Objects.Label> return_value = new Gee.HashMap<string, Objects.Label> ();
+        if (project == null) return return_value;
+
         foreach (unowned Json.Node element in node.get_object ().get_array_member ("labels").get_elements ()) {
             Objects.Label label = Services.Store.instance ().get_label_by_name (element.get_string (), true, project.source_id);
             return_value[label.id] = label;
@@ -873,6 +967,7 @@ public class Objects.Item : Objects.BaseObject {
 
     public Gee.HashMap<string, Objects.Label> get_labels_maps_from_caldav (GLib.SList<string> categories_list) {
         Gee.HashMap<string, Objects.Label> return_value = new Gee.HashMap<string, Objects.Label> ();
+        if (project == null) return return_value;
 
         foreach (string category in categories_list) {
             Objects.Label label = Services.Store.instance ().get_label_by_name (category, true, project.source_id);
@@ -951,6 +1046,7 @@ public class Objects.Item : Objects.BaseObject {
         }
 
         if (project.source_type == SourceType.CALDAV) {
+            /* Persist immediately so dirty edits survive debounce/app state changes. */
             needs_push = true;
             Services.Store.instance ().update_item (this, update_id);
         }
@@ -958,12 +1054,9 @@ public class Objects.Item : Objects.BaseObject {
         update_timeout_id = Timeout.add (Constants.UPDATE_TIMEOUT, () => {
             update_timeout_id = 0;
 
-            if (project.source_type != SourceType.CALDAV) {
-                // Optimistic local update
+            if (project.source_type == SourceType.LOCAL) {
                 Services.Store.instance ().update_item (this, update_id);
-            }
-
-            if (project.source_type == SourceType.TODOIST) {
+            } else if (project.source_type == SourceType.TODOIST) {
                 Services.Todoist.get_default ().update.begin (this, (obj, res) => {
                     Services.Todoist.get_default ().update.end (res);
                     Services.Store.instance ().update_item (this, update_id);
@@ -990,6 +1083,7 @@ public class Objects.Item : Objects.BaseObject {
         }
 
         if (project.source_type == SourceType.CALDAV) {
+            /* Persist immediately so dirty edits survive debounce/app state changes. */
             needs_push = true;
             Services.Store.instance ().update_item (this, update_id);
         }
@@ -998,12 +1092,8 @@ public class Objects.Item : Objects.BaseObject {
             update_timeout_id = 0;
             loading = true;
 
-            if (project.source_type != SourceType.CALDAV) {
-                // Optimistic local update
-                Services.Store.instance ().update_item (this, update_id);
-            }
-
             if (project.source_type == SourceType.LOCAL) {
+                Services.Store.instance ().update_item (this, update_id);
                 loading = false;
             } else if (project.source_type == SourceType.TODOIST) {
                 Services.Todoist.get_default ().update.begin (this, (obj, res) => {
@@ -1032,13 +1122,8 @@ public class Objects.Item : Objects.BaseObject {
     public void update_async (string update_id = "") {
         loading = true;
 
-        if (project.source_type == SourceType.CALDAV) {
-            needs_push = true;
-        }
-        // Optimistic local update
-        Services.Store.instance ().update_item (this, update_id);
-
         if (project.source_type == SourceType.LOCAL) {
+            Services.Store.instance ().update_item (this, update_id);
             loading = false;
         } else if (project.source_type == SourceType.TODOIST) {
             Services.Todoist.get_default ().update.begin (this, (obj, res) => {
@@ -1047,6 +1132,8 @@ public class Objects.Item : Objects.BaseObject {
                 loading = false;
             });
         } else if (project.source_type == SourceType.CALDAV) {
+            needs_push = true;
+            Services.Store.instance ().update_item (this, update_id);
             var caldav_client = Services.CalDAV.Core.get_default ().get_client (project.source);
             caldav_client.add_item.begin (this, true, (obj, res) => {
                 HttpResponse response = caldav_client.add_item.end (res);
@@ -1077,7 +1164,7 @@ public class Objects.Item : Objects.BaseObject {
 
                 if (response.status) {
                     needs_push = false;
-                    Services.Store.instance ().update_item (this, "");
+                    Services.Store.instance ().update_item_pin (this);
                 }
 
                 loading = false;
@@ -1481,12 +1568,10 @@ public class Objects.Item : Objects.BaseObject {
         ical.set_summary (content);
         ical.set_description (description);
 
-        if (pinned) {
-            var pinned_property = new ICal.Property (ICal.PropertyKind.X_PROPERTY);
-            pinned_property.set_x_name ("X-PINNED");
-            pinned_property.set_x (pinned.to_string ());
-            ical.add_property (pinned_property);
-        }
+        var pinned_property = new ICal.Property (ICal.PropertyKind.X_PROPERTY);
+        pinned_property.set_x_name ("X-PINNED");
+        pinned_property.set_x (pinned.to_string ());
+        ical.add_property (pinned_property);
 
         if (has_due) {
             ICal.Time new_icaltime = Utils.Datetime.datetimes_to_icaltime (
@@ -1549,7 +1634,7 @@ public class Objects.Item : Objects.BaseObject {
                         }
                     }
 
-                    rrule.set_by_array (ICal.RecurrenceByRule.BY_DAY, values);
+                    rrule.set_by_day_array (values);
                 } else if (due.recurrency_type == RecurrencyType.EVERY_MONTH) {
                     rrule.set_freq (ICal.RecurrenceFrequency.MONTHLY_RECURRENCE);
                 } else if (due.recurrency_type == RecurrencyType.EVERY_YEAR) {
@@ -1615,33 +1700,30 @@ public class Objects.Item : Objects.BaseObject {
         child_order_property.set_x (child_order.to_string ());
         ical.add_property (child_order_property);
 
-        var pinned_property = new ICal.Property (ICal.PropertyKind.X_PROPERTY);
-        pinned_property.set_x_name ("X-PINNED");
-        pinned_property.set_x (pinned.to_string ());
-        ical.add_property (pinned_property);
+        if (this.section_id != null && this.section_id != "") {
+            var section = Services.Store.instance ().get_section (this.section_id);
+            if (section != null) {
+                // Embed the section name in a custom X-property
+                var section_name_property = new ICal.Property (ICal.PropertyKind.X_PROPERTY);
+                section_name_property.set_x_name ("X-PLANIFY-SECTION-NAME");
+                section_name_property.set_x (section.name);
+                ical.add_property (section_name_property);
 
-        if (has_section && section != null) {
-            var section_id_property = new ICal.Property (ICal.PropertyKind.X_PROPERTY);
-            section_id_property.set_x_name ("X-PLANIFY-SECTION-ID");
-            section_id_property.set_x (section.id);
-            ical.add_property (section_id_property);
+                var section_id_property = new ICal.Property (ICal.PropertyKind.X_PROPERTY);
+                section_id_property.set_x_name ("X-PLANIFY-SECTION-ID");
+                section_id_property.set_x (section.id);
+                ical.add_property (section_id_property);
 
-            var section_name_property = new ICal.Property (ICal.PropertyKind.X_PROPERTY);
-            section_name_property.set_x_name ("X-PLANIFY-SECTION-NAME");
-            section_name_property.set_x (section.name);
-            ical.add_property (section_name_property);
-
-            var section_color_property = new ICal.Property (ICal.PropertyKind.X_PROPERTY);
-            section_color_property.set_x_name ("X-PLANIFY-SECTION-COLOR");
-            section_color_property.set_x (section.color);
-            ical.add_property (section_color_property);
+                if (section.color != null && section.color != "") {
+                    var section_color_property = new ICal.Property (ICal.PropertyKind.X_PROPERTY);
+                    section_color_property.set_x_name ("X-PLANIFY-SECTION-COLOR");
+                    section_color_property.set_x (section.color);
+                    ical.add_property (section_color_property);
+                }
+            }
         }
 
-        var item_type_property = new ICal.Property (ICal.PropertyKind.X_PROPERTY);
-        item_type_property.set_x_name ("X-PLANIFY-ITEM-TYPE");
-        item_type_property.set_x (item_type.to_string ());
-        ical.add_property (item_type_property);
-
+        // Embed deadline date
         if (has_deadline) {
             var deadline_property = new ICal.Property (ICal.PropertyKind.X_PROPERTY);
             deadline_property.set_x_name ("X-PLANIFY-DEADLINE");
@@ -1649,9 +1731,27 @@ public class Objects.Item : Objects.BaseObject {
             ical.add_property (deadline_property);
         }
 
+        // Embed item type (task vs note)
+        if (item_type != ItemType.TASK) {
+            var item_type_property = new ICal.Property (ICal.PropertyKind.X_PROPERTY);
+            item_type_property.set_x_name ("X-PLANIFY-ITEM-TYPE");
+            item_type_property.set_x (item_type.to_string ());
+            ical.add_property (item_type_property);
+        }
+
+        // Embed attachments as ATTACH properties
         foreach (var attachment in attachments) {
-            var attach_property = new ICal.Property.attach (new ICal.Attach.from_url (attachment.file_path));
-            ical.add_property (attach_property);
+            if (attachment.file_path != null && attachment.file_path != "") {
+                var attach_property = new ICal.Property (ICal.PropertyKind.X_PROPERTY);
+                attach_property.set_x_name ("X-PLANIFY-ATTACH");
+                attach_property.set_x (escape_ical_text_value ("%s|%s|%s|%s".printf (
+                    attachment.id,
+                    attachment.file_name,
+                    attachment.file_type,
+                    attachment.file_path
+                )));
+                ical.add_property (attach_property);
+            }
         }
 
         foreach (var reminder in reminders) {
@@ -1659,22 +1759,23 @@ public class Objects.Item : Objects.BaseObject {
                 continue;
             }
 
+            /* RFC 5545 §3.6.6 — one ACTION, TRIGGER, DESCRIPTION. MSYS2 libical-glib.vapi has no Property.action/trigger or ICal.Trigger; parse from text. */
             string alarm_desc = (content != null && content.strip () != "") ? content : _("Reminder");
             alarm_desc = escape_ical_text_value (alarm_desc);
 
             var alarm_sb = new StringBuilder ();
-            alarm_sb.append ("BEGIN:VALARM\r\n");
-            alarm_sb.append ("ACTION:DISPLAY\r\n");
-            alarm_sb.append_printf ("DESCRIPTION:%s\r\n", alarm_desc);
+            alarm_sb.append ("BEGIN:VALARM\n");
+            alarm_sb.append ("ACTION:DISPLAY\n");
+            alarm_sb.append_printf ("DESCRIPTION:%s\n", alarm_desc);
 
             if (reminder.reminder_type == ReminderType.RELATIVE) {
                 int mm = reminder.mm_offset > 0 ? reminder.mm_offset : 0;
-                alarm_sb.append_printf ("TRIGGER:-PT%dM\r\n", mm);
+                alarm_sb.append_printf ("TRIGGER:-PT%dM\n", mm);
             } else if (reminder.due != null && reminder.due.date != "" && reminder.due.datetime != null) {
                 var dt_utc = reminder.due.datetime.to_utc ();
-                alarm_sb.append_printf ("TRIGGER;VALUE=DATE-TIME:%s\r\n", dt_utc.format ("%Y%m%dT%H%M%SZ"));
+                alarm_sb.append_printf ("TRIGGER;VALUE=DATE-TIME:%s\n", dt_utc.format ("%Y%m%dT%H%M%SZ"));
             } else {
-                alarm_sb.append ("TRIGGER:-PT0S\r\n");
+                alarm_sb.append ("TRIGGER:-PT0S\n");
             }
 
             alarm_sb.append ("END:VALARM");
@@ -1682,11 +1783,88 @@ public class Objects.Item : Objects.BaseObject {
             ical.add_component (alarm);
         }
 
-        return "%s%s%s".printf (
+        var vtodo_string = ical.as_ical_string ();
+
+        var attach_uri_lines = new StringBuilder ();
+        foreach (var attachment in attachments) {
+            if (attachment.file_path == null || attachment.file_path == "") {
+                continue;
+            }
+            string fp = attachment.file_path;
+            if (fp.has_prefix ("http://") || fp.has_prefix ("https://")) {
+                attach_uri_lines.append ("ATTACH;VALUE=URI:");
+                attach_uri_lines.append (escape_ical_text_value (fp));
+                attach_uri_lines.append ("\r\n");
+            }
+        }
+        if (attach_uri_lines.len > 0) {
+            long end_vtodo = vtodo_string.last_index_of ("END:VTODO");
+            if (end_vtodo >= 0) {
+                vtodo_string = vtodo_string.substring (0, (ssize_t) end_vtodo) + attach_uri_lines.str + vtodo_string.substring ((ssize_t) end_vtodo, vtodo_string.length - (ssize_t) end_vtodo);
+            }
+        }
+
+        var raw = "%s%s%s".printf (
             "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//Planify App (https://github.com/alainm23/planify)\n",
-            ical.as_ical_string (),
+            vtodo_string,
             "END:VCALENDAR\n"
         );
+
+        // #region agent log
+        debug_agent_log (
+            "initial",
+            "H4",
+            "Item.to_ical",
+            "Serialized VTODO payload before PUT",
+            """{"itemId":"%s","projectId":"%s","hasSectionNameProp":%s,"hasSectionColorProp":%s,"hasSectionIdProp":%s,"hasCategories":%s,"labelsCount":%d,"hasDeadline":%s,"attachmentCount":%d,"reminderCount":%d}""".printf (
+                debug_json_escape (id),
+                debug_json_escape (project_id),
+                vtodo_string.contains ("X-PLANIFY-SECTION-NAME") ? "true" : "false",
+                vtodo_string.contains ("X-PLANIFY-SECTION-COLOR") ? "true" : "false",
+                vtodo_string.contains ("X-PLANIFY-SECTION-ID") ? "true" : "false",
+                vtodo_string.contains ("CATEGORIES") ? "true" : "false",
+                labels.size,
+                vtodo_string.contains ("X-PLANIFY-DEADLINE") ? "true" : "false",
+                attachments.size,
+                reminders.size
+            )
+        );
+        // #endregion
+
+        // RFC5545 requires CRLF line endings; normalize to CRLF to improve server compatibility.
+        return raw.replace ("\n", "\r\n");
+    }
+
+    private string attachment_display_name_from_uri (string uri) {
+        try {
+            GLib.Uri u = GLib.Uri.parse (uri, GLib.UriFlags.NONE);
+            string? path = u.get_path ();
+            if (path != null && path != "") {
+                return Filename.display_basename (path);
+            }
+        } catch (Error e) {
+        }
+        return _("Attachment");
+    }
+
+    private void parse_planify_attachment_payload (string attach_str) {
+        string[] parts = attach_str.split ("|");
+        if (parts.length != 4) {
+            return;
+        }
+
+        var attachment_uri = parts[3];
+        if (Constants.debug_caldav_http ()) {
+            Constants.log_debug_http ("[Attachment Audit] Task %s attached URI: %s\n".printf (this.id, attachment_uri));
+        }
+
+        var attachment = new Objects.Attachment ();
+        attachment.id = parts[0];
+        attachment.file_name = parts[1];
+        attachment.file_type = parts[2];
+        attachment.file_path = attachment_uri;
+        attachment.item_id = this.id;
+        add_attachment_if_not_exists (attachment);
     }
 
     public Objects.Item add_item_if_not_exists (Objects.Item new_item, bool insert = true) {
@@ -1812,6 +1990,191 @@ public class Objects.Item : Objects.BaseObject {
             }
             
             Services.Store.instance ().delete_item (subitem);
+        }
+    }
+
+    private Gee.ArrayList<Objects.Label> get_labels_from_categories (string categories_str) {
+        Gee.ArrayList<Objects.Label> return_value = new Gee.ArrayList<Objects.Label> ();
+        string[] categories = categories_str.split (",");
+        string sid = project != null ? project.source_id : "";
+        foreach (var category in categories) {
+            var label_name = category.strip ();
+            if (label_name == "") continue;
+            var label = Services.Store.instance ().get_label_by_name (label_name, true, sid);
+            if (label == null) {
+                label = new Objects.Label ();
+                label.id = Util.get_default ().generate_id (label);
+                label.name = label_name;
+                label.color = Util.get_default ().get_random_color ();
+                label.source_id = sid;
+                Services.Store.instance ().insert_label (label);
+            }
+            return_value.add (label);
+        }
+        return return_value;
+    }
+
+    private Gee.HashMap<string, Objects.Label> get_labels_maps_from_categories (string categories_str) {
+        Gee.HashMap<string, Objects.Label> return_value = new Gee.HashMap<string, Objects.Label> ();
+        var labels_list = get_labels_from_categories (categories_str);
+        foreach (var label in labels_list) {
+            return_value[label.id] = label;
+        }
+        return return_value;
+    }
+
+    /** Parse DURATION-style TRIGGER (e.g. -PT15M, -PT1H, -P1D, -PT1H30M) into minutes for RELATIVE reminders. */
+    private int parse_8601_duration_trigger_to_minutes (string trigger_str) {
+        string t = trigger_str.strip ();
+        if (t == "") {
+            return -1;
+        }
+        if (t.has_prefix ("-")) {
+            t = t.substring (1).strip ();
+        }
+        if (!t.has_prefix ("P")) {
+            return -1;
+        }
+
+        int minutes = 0;
+        try {
+            var re_d = new Regex ("^P(\\d+)D", RegexCompileFlags.CASELESS);
+            MatchInfo mid;
+            if (re_d.match (t, 0, out mid)) {
+                minutes += int.parse (mid.fetch (1)) * 24 * 60;
+            }
+        } catch (Error e) {
+        }
+
+        long idx = t.index_of ("T");
+        if (idx < 0) {
+            return minutes > 0 ? minutes : -1;
+        }
+
+        string tp = t.substring ((ssize_t) (idx + 1));
+        try {
+            var re_h = new Regex ("(\\d+)H", RegexCompileFlags.CASELESS);
+            var re_m = new Regex ("(\\d+)M", RegexCompileFlags.CASELESS);
+            var re_s = new Regex ("(\\d+)S", RegexCompileFlags.CASELESS);
+            MatchInfo mih, mim, mis;
+            if (re_h.match (tp, 0, out mih)) {
+                minutes += int.parse (mih.fetch (1)) * 60;
+            }
+            if (re_m.match (tp, 0, out mim)) {
+                minutes += int.parse (mim.fetch (1));
+            }
+            if (re_s.match (tp, 0, out mis)) {
+                minutes += (int.parse (mis.fetch (1)) + 59) / 60;
+            }
+        } catch (Error e) {
+            warning ("VALARM duration parse: %s", e.message);
+        }
+
+        return minutes;
+    }
+
+    /** Normalize TRIGGER value for parsing (handles RELATED=/VALUE= forms some clients emit). */
+    private string? normalize_valarm_trigger_value (string? raw) {
+        if (raw == null || raw == "") {
+            return raw;
+        }
+        string t = raw.strip ();
+        try {
+            var re = new Regex ("-?PT\\d+[HMS]", RegexCompileFlags.CASELESS);
+            MatchInfo mi;
+            if (re.match (t, 0, out mi)) {
+                return mi.fetch (0);
+            }
+        } catch (Error e) {
+            // fall through
+        }
+        long last_colon = t.last_index_of (":");
+        if (last_colon >= 0 && last_colon < (long) t.length - 1) {
+            string tail = t.substring ((ssize_t) (last_colon + 1)).strip ();
+            if (tail != "") {
+                return tail;
+            }
+        }
+        return t;
+    }
+
+    private void parse_reminders_from_vtodo (ICal.Component ical_vtodo) {
+        if (ical_vtodo == null) {
+            return;
+        }
+        var seen_triggers = new Gee.HashSet<string> ();
+        int parsed_count = 0;
+        int deduped_count = 0;
+        int relative_count = 0;
+        int absolute_count = 0;
+        ICal.Component ? alarm = ical_vtodo.get_first_component (ICal.ComponentKind.VALARM_COMPONENT);
+        while (alarm != null) {
+            ICal.Property ? trigger_prop = alarm.get_first_property (ICal.PropertyKind.TRIGGER_PROPERTY);
+            if (trigger_prop != null) {
+                var trigger_str = normalize_valarm_trigger_value (trigger_prop.get_value_as_string ());
+                if (trigger_str != null && trigger_str != "") {
+                    if (seen_triggers.contains (trigger_str)) {
+                        deduped_count++;
+                        alarm = ical_vtodo.get_next_component (ICal.ComponentKind.VALARM_COMPONENT);
+                        continue;
+                    }
+
+                    seen_triggers.add (trigger_str);
+
+                    var reminder = new Objects.Reminder ();
+                    reminder.item_id = this.id;
+                    
+                    if (trigger_str.has_prefix ("P") || trigger_str.has_prefix ("-P")) {
+                        /* Duration based trigger (RELATIVE) — hours/days, not only minutes */
+                        reminder.reminder_type = ReminderType.RELATIVE;
+                        relative_count++;
+                        int mm = parse_8601_duration_trigger_to_minutes (trigger_str);
+                        if (mm >= 0) {
+                            reminder.mm_offset = mm;
+                        } else if (trigger_str.contains ("M")) {
+                            try {
+                                var re = new Regex ("-?PT(\\d+)M", RegexCompileFlags.CASELESS);
+                                MatchInfo mi;
+                                if (re.match (trigger_str, 0, out mi)) {
+                                    reminder.mm_offset = int.parse (mi.fetch (1));
+                                }
+                            } catch (Error re_err) {
+                                warning ("VALARM trigger parse: %s", re_err.message);
+                            }
+                        }
+                    } else {
+                        // Date-time based trigger (ABSOLUTE)
+                        reminder.reminder_type = ReminderType.ABSOLUTE;
+                        absolute_count++;
+                        var trigger_time = ICal.Time.from_string (trigger_str);
+                        if (!trigger_time.is_null_time ()) {
+                            reminder.due.datetime = Utils.Datetime.ical_to_date_time_local (trigger_time);
+                        }
+                    }
+                    reminder.id = Util.get_default ().generate_id (reminder);
+                    add_reminder_if_not_exists (reminder);
+                    parsed_count++;
+                }
+            }
+            alarm = ical_vtodo.get_next_component (ICal.ComponentKind.VALARM_COMPONENT);
+        }
+
+        if (parsed_count > 0 || deduped_count > 0) {
+            // #region agent log
+            debug_agent_log (
+                "initial",
+                "H3",
+                "Item.parse_reminders_from_vtodo",
+                "Parsed VALARM triggers",
+                """{"itemId":"%s","parsedCount":%d,"dedupedCount":%d,"relativeCount":%d,"absoluteCount":%d}""".printf (
+                    debug_json_escape (id),
+                    parsed_count,
+                    deduped_count,
+                    relative_count,
+                    absolute_count
+                )
+            );
+            // #endregion
         }
     }
 
@@ -2126,6 +2489,9 @@ public class Objects.Item : Objects.BaseObject {
         } else {
             reminder.id = Util.get_default ().generate_id (reminder);
             add_reminder_if_not_exists (reminder);
+            if (project.source_type == SourceType.CALDAV) {
+                update_async ("");
+            }
         }
     }
 
