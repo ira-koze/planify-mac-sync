@@ -90,6 +90,9 @@ public class Widgets.AttachmentRow : Gtk.ListBoxRow {
         remove_gesture.pressed.connect (() => {
             remove_gesture.set_state (Gtk.EventSequenceState.CLAIMED);
             attachment.delete ();
+            if (attachment.item != null) {
+                attachment.item.update_async ("");
+            }
         });
     }
 
@@ -101,9 +104,21 @@ public class Widgets.AttachmentRow : Gtk.ListBoxRow {
                 throw new GLib.IOError.INVALID_ARGUMENT ("File path is empty");
             }
 
+            if (attachment.file_path.has_prefix ("http://") || attachment.file_path.has_prefix ("https://")) {
+                Util.open_url (attachment.file_path);
+                close_button.is_loading = false;
+                return;
+            }
+
+            if (!attachment.file_path.has_prefix ("file://")) {
+                Util.open_url (attachment.file_path);
+                close_button.is_loading = false;
+                return;
+            }
+
             var file = GLib.File.new_for_uri (attachment.file_path);
             if (!file.query_exists ()) {
-                throw new GLib.IOError.NOT_FOUND ("File no longer exists");
+                throw new GLib.IOError.NOT_FOUND (_("This local file is not available on this device"));
             }
 
             var app_info = GLib.AppInfo.get_default_for_uri_scheme ("file");
@@ -119,7 +134,7 @@ public class Widgets.AttachmentRow : Gtk.ListBoxRow {
                 file_list.append (file);
                 app_info.launch (file_list, null);
             } else {
-                GLib.AppInfo.launch_default_for_uri (attachment.file_path, null);
+                Util.open_url (attachment.file_path);
             }
 
             close_button.is_loading = false;
@@ -134,7 +149,7 @@ public class Widgets.AttachmentRow : Gtk.ListBoxRow {
     public void hide_destroy () {
         main_revealer.reveal_child = false;
         Timeout.add (main_revealer.transition_duration, () => {
-            ((Gtk.ListBox) parent).remove (this);
+            unparent ();
             return GLib.Source.REMOVE;
         });
     }

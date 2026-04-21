@@ -23,6 +23,7 @@ public class Widgets.Attachments : Adw.Bin {
     public Objects.Item item { get; set; }
 
     public Widgets.LoadingButton add_button;
+    public Widgets.LoadingButton add_link_button;
     private Gtk.ListBox listbox;
     private Gtk.Label count_label;
 
@@ -67,9 +68,15 @@ public class Widgets.Attachments : Adw.Bin {
 
         add_button = new Widgets.LoadingButton.with_icon ("plus-large-symbolic", 16) {
             css_classes = { "flat" },
-            hexpand = true,
             halign = END
         };
+
+        add_link_button = new Widgets.LoadingButton.with_label (_("Add Link")) {
+            css_classes = { "flat" },
+            hexpand = true
+        };
+        add_link_button.tooltip_text = _("Add URL attachment");
+        add_button.tooltip_text = _("Add file attachment");
 
         var headerbox = new Gtk.Box (Gtk.Orientation.HORIZONTAL, 0) {
             margin_start = is_board ? 9 : 6,
@@ -77,6 +84,7 @@ public class Widgets.Attachments : Adw.Bin {
         };
         headerbox.append (title);
         headerbox.append (count_label);
+        headerbox.append (add_link_button);
         headerbox.append (add_button);
 
         listbox = new Gtk.ListBox () {
@@ -110,6 +118,10 @@ public class Widgets.Attachments : Adw.Bin {
         add_button.clicked.connect (() => {
             file_selector_opened (true);
             show_file_selector ();
+        });
+
+        add_link_button.clicked.connect (() => {
+            show_link_dialog ();
         });
 
         var dnd_controller = new Gtk.DropTarget (typeof (Gdk.FileList), Gdk.DragAction.COPY);
@@ -202,6 +214,67 @@ public class Widgets.Attachments : Adw.Bin {
             attachment.item_id = item.id;
             item.add_attachment_if_not_exists (attachment);
         }
+
+        item.update_async ("");
+    }
+
+    private void show_link_dialog () {
+        var dialog = new Adw.MessageDialog (
+            Planify._instance.main_window,
+            _("Add link"),
+            _("Enter a valid URL (http:// or https://)")
+        );
+        var entry = new Gtk.Entry () {
+            placeholder_text = "https://",
+            activates_default = true
+        };
+        dialog.set_extra_child (entry);
+        dialog.add_response ("cancel", _("Cancel"));
+        dialog.add_response ("add", _("Add"));
+        dialog.set_response_appearance ("add", Adw.ResponseAppearance.SUGGESTED);
+        dialog.set_default_response ("add");
+        dialog.set_close_response ("cancel");
+
+        dialog.response.connect ((response) => {
+            if (response == "add") {
+                add_link_attachment (entry.text);
+            }
+            dialog.close ();
+        });
+
+        dialog.present ();
+    }
+
+    private void add_link_attachment (string url_input) {
+        string url = url_input != null ? url_input.strip () : "";
+        if (!(url.has_prefix ("http://") || url.has_prefix ("https://"))) {
+            Services.EventBus.get_default ().send_toast (
+                Util.get_default ().create_toast (_("Please enter a valid http(s) URL"))
+            );
+            return;
+        }
+
+        var attachment = new Objects.Attachment ();
+        attachment.id = Util.get_default ().generate_id ();
+        attachment.item_id = item.id;
+        attachment.file_type = "text/uri-list";
+        attachment.file_path = url;
+
+        try {
+            var parsed = GLib.Uri.parse (url, GLib.UriFlags.NONE);
+            string ? path = parsed.get_path ();
+            if (path != null && path != "") {
+                attachment.file_name = Filename.display_basename (path);
+            } else {
+                string ? host = parsed.get_host ();
+                attachment.file_name = (host != null && host != "") ? host : _("Attachment");
+            }
+        } catch (Error e) {
+            attachment.file_name = _("Attachment");
+        }
+
+        item.add_attachment_if_not_exists (attachment);
+        item.update_async ("");
     }
 
     public void present_item (Objects.Item _item) {
@@ -236,7 +309,7 @@ public class Widgets.Attachments : Adw.Bin {
     }
 
     public void add_attachment (Objects.Attachment attachment) {
-        if (!attachments_map.has_key (item.id)) {
+        if (!attachments_map.has_key (attachment.id)) {
             attachments_map[attachment.id] = new Widgets.AttachmentRow (attachment);
             listbox.append (attachments_map[attachment.id]);
         }
